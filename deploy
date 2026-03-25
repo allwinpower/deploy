@@ -1,0 +1,595 @@
+#!/bin/bash
+# Strict mode: Exit immediately if a command exits with a non-zero status,
+# exit if an undefined variable is used, and propagate the exit status of
+# the last command in a pipeline.
+set -euo pipefail
+
+# Export COMPOSE_BAKE for Docker Compose build behavior
+export COMPOSE_BAKE=true
+
+TEMP_YML_FILE=""
+
+# Determine Docker Compose profiles
+# Using ${1:-} to prevent "unbound variable" error if $1 is not provided
+if [ -z "${1:-}" ]; then
+  export COMPOSE_PROFILES="dev"
+else
+  export COMPOSE_PROFILES="$1"
+fi
+
+# ==============================================================================
+# Helper Functions for Whiptail Menus
+# ==============================================================================
+
+# Generic function to display a select menu using whiptail
+# Args: title, menu_text, options_array (passed by nameref)
+# Returns: selected_item or empty string on cancel
+whiptail_menu() {
+    local title="$1"
+    local menu_text="$2"
+    local -n options_ref=$3 # Use nameref for array
+    local height=20
+    local width=78
+    local list_height=10
+
+    # Ensure whiptail is installed
+    if ! command -v whiptail &> /dev/null; then
+        echo "Error: whiptail is not installed. Please install it (e.g., sudo apt install whiptail)." >&2
+        return 1
+    fi
+
+    whiptail --title "$title" --menu "$menu_text" "$height" "$width" "$list_height" \
+        "${options_ref[@]}" 3>&1 1>&2 2>&3
+}
+
+# Generic function to find files and present a select menu
+# Args: file_type (e.g., "ENV", "YML"), default_file, search_pattern
+# Returns: selected_file_path or empty string on cancel
+select_file() {
+    local file_type="$1"
+    local default_file="$2"
+    local search_pattern="$3"
+
+    local files=()
+    # Add default file if it exists and is a regular file
+    if [[ -f "$default_file" ]]; then
+        files+=("$default_file")
+    fi
+
+    # Find other matching files, excluding the default, and add them
+    while IFS= read -r -d '' file; do
+        if [[ "$file" != "$default_file" ]]; then
+            files+=("$file")
+        fi
+    done < <(find . -maxdepth 2 -name "$search_pattern" -not -path "$default_file" -print0)
+
+    # Prepare menu options array
+    local menu_options=()
+    for file in "${files[@]}"; do
+        menu_options+=("$file" "")
+    done
+
+    # Construct the title
+    local title="Select $file_type File"
+    local selected_file
+    selected_file=$(whiptail_menu "$title" "Choose a $file_type file:" menu_options)
+    local exit_status=$?
+
+    if [ "$exit_status" -ne 0 ]; then
+        echo "" # Return empty on cancel
+        return 1
+    fi
+    echo "$selected_file"
+}
+
+# Function to parse docker-compose.yml and present a select menu of services
+# Sets global variable SERVICE_NAME on success
+# Returns 0 on success, 1 on cancel or error
+select_service() {
+    # Ensure yq is installed
+    if ! command -v yq &> /dev/null; then
+        echo "Error: yq is not installed. Please install it (e.g., sudo snap install yq)." >&2
+        return 1
+    fi
+
+    local services
+    # Add || true to prevent set -e from exiting if yq finds no services (e.g., empty yml)
+    services=$(yq e '.services | keys | .[]' "$TEMP_YML_FILE" || true)
+
+    local menu_options=()
+    # Check if services is empty
+    if [ -z "$services" ]; then
+        echo "No services found in '$TEMP_YML_FILE'." >&2
+        return 1
+    fi
+
+    while IFS= read -r service; do
+        menu_options+=("$service" "")
+    done <<< "$services"
+
+    local selected_service
+    selected_service=$(whiptail_menu "Select a Service" "Choose a service:" menu_options)
+    local exit_status=$?
+
+    if [ "$exit_status" -ne 0 ]; then
+        echo "Service selection cancelled." >&2
+        return 1
+    fi
+    export SERVICE_NAME="$selected_service"
+    return 0
+}
+
+# Function to select the deployment method
+# Sets global variable DOCKER_HOST based on selection
+# Returns 0 on success, 1 on cancel or error
+select_deployment_method() {
+    local methods=()
+    local menu_options=()
+
+    # Only add SSH_URI option if it's set in the .env file
+    if [ -n "${SSH_URI:-}" ]; then # Use :- to prevent error if SSH_URI is unset
+        methods+=("$SSH_URI")
+    fi
+
+    # Add other options
+    methods+=("Locally" "Custom SSH Connection")
+
+    for method in "${methods[@]}"; do
+        menu_options+=("$method" "")
+    done
+
+    local selected_method
+    selected_method=$(whiptail_menu "Select Deployment Method" "Choose deployment method:" menu_options)
+    local exit_status=$?
+
+    if [ "$exit_status" -ne 0 ]; then
+        echo "Deployment method selection cancelled. Exiting." >&2
+        return 1
+    fi
+
+    case "$selected_method" in
+    "$SSH_URI")
+        export DOCKER_HOST="$SSH_URI"
+        echo "Selected deployment method: Pre-configured SSH URI ($SSH_URI)"
+        ;;
+    "Locally")
+        unset DOCKER_HOST # Ensure DOCKER_HOST is not set for local
+        echo "Selected deployment method: Locally"
+        ;;
+    "Custom SSH Connection")
+        local custom_ssh_uri
+        custom_ssh_uri=$(whiptail --inputbox "Enter SSH URI (user@server):" 8 78 "" 3>&1 1>&2 2>&3)
+        exit_status=$?
+        if [ "$exit_status" -ne 0 ]; then
+            echo "Custom SSH URI input cancelled. Exiting." >&2
+            return 1
+        fi
+        if [ -z "$custom_ssh_uri" ]; then
+            echo "No SSH URI entered. Exiting." >&2
+            return 1
+        fi
+        export DOCKER_HOST="$custom_ssh_uri"
+        echo "Selected deployment method: Custom SSH URI ($custom_ssh_uri)"
+        ;;
+    esac
+    return 0
+}
+
+# Generate a temporary compose file with env vars pre-substituted via envsubst.
+# Requires $ENV_FILE and $YML_FILE to be set.
+# Sets global $TEMP_YML_FILE and registers a cleanup trap.
+prepare_temp_compose() {
+    # Create temp file alongside the original so relative build paths resolve correctly
+    local yml_dir
+    yml_dir=$(dirname "$(realpath "$YML_FILE")")
+    TEMP_YML_FILE=$(mktemp "${yml_dir}/.docker-compose-XXXXXX.yml")
+    trap 'rm -f "$TEMP_YML_FILE"' EXIT INT TERM
+
+    # Build the list of variable names from the env file so envsubst only
+    # substitutes known vars (avoids clobbering unrelated $ signs in YAML).
+    local var_list
+    var_list=$(grep -v '^\s*#' "$ENV_FILE" | grep '=' | cut -d= -f1 | sed 's/^/\$/' | tr '\n' ' ')
+
+    envsubst "$var_list" < "$YML_FILE" > "$TEMP_YML_FILE"
+
+    # Fail if any ${...} placeholders remain unresolved
+    local unresolved
+    unresolved=$(grep -o '\${[^}]*}' "$TEMP_YML_FILE" | sort -u || true)
+    if [ -n "$unresolved" ]; then
+        echo "ERROR: Unresolved variables remain in compose file after substitution:" >&2
+        echo "$unresolved" >&2
+        echo "Add the missing variables to your env file: $ENV_FILE" >&2
+        return 1
+    fi
+
+    echo "Temp compose file written: $TEMP_YML_FILE"
+}
+
+# Function to construct the Docker Compose command
+# Returns the full docker compose command string
+compose_cmd() {
+    echo "docker compose -f \"$TEMP_YML_FILE\""
+}
+
+# Function to execute a Docker Compose command
+# Args: compose_action (e.g., "build", "up -d"), service_name (optional)
+# Returns 0 on success, 1 on failure
+execute_compose_command() {
+    local compose_action="$1"
+    local service_name="${2:-}" # Optional service name
+
+    local base_cmd
+    base_cmd=$(compose_cmd)
+
+    echo "Executing: $base_cmd $compose_action $service_name"
+    # Using eval here is necessary because the DOCKER_HOST variable needs to be active
+    # for the `docker compose` command itself, and base_cmd is a string.
+    if eval "$base_cmd $compose_action $service_name"; then
+        echo "Command executed successfully."
+        return 0
+    else
+        echo "Error executing command." >&2
+        return 1
+    fi
+}
+
+# ==============================================================================
+# Docker Service Management Functions
+# ==============================================================================
+
+create_external_networks() {
+    echo "Checking for and creating external networks..."
+    local raw_names
+    # Read the actual Docker network name from the 'name:' sub-key (not the YAML map key).
+    # Fall back to the YAML key if 'name:' is absent.
+    raw_names=$(yq e '.networks | to_entries | map(select(.value.external == true)) | .[].value.name' "$TEMP_YML_FILE" 2>/dev/null || \
+                yq e '.networks | to_entries | map(select(.value.external == true)) | .[].key' "$TEMP_YML_FILE" || true)
+
+    if [ -z "$raw_names" ]; then
+        echo "No external networks defined in $TEMP_YML_FILE."
+        return 0
+    fi
+
+    while IFS= read -r raw_network; do
+        # Expand any ${VAR:-default} patterns that envsubst left behind
+        local network
+        network=$(eval echo "$raw_network")
+        echo "Attempting to create external network: $network"
+        # DOCKER_HOST is honored by `docker network create`
+        if docker network inspect "$network" &>/dev/null; then
+            echo "Network '$network' already exists. Skipping creation."
+        else
+            if ! docker network create "$network"; then
+                echo "Error: Failed to create network '$network'." >&2
+                return 1
+            fi
+        fi
+    done <<< "$raw_names"
+    return 0
+}
+
+deploy_all_services() {
+    echo "Deploying all services..."
+    if ! create_external_networks; then
+        echo "Failed to create external networks. Aborting deployment." >&2
+        return 1
+    fi
+
+    if execute_compose_command "build" && \
+       execute_compose_command "up -d --force-recreate --remove-orphans"; then
+        echo "All services deployed successfully."
+        return 0
+    else
+        echo "Failed to deploy all services." >&2
+        return 1
+    fi
+}
+
+redeploy_single_service() {
+    if ! select_service; then
+        return 1 # User cancelled or no services found
+    fi
+    echo "Redeploying service: $SERVICE_NAME..."
+
+    if execute_compose_command "build" "$SERVICE_NAME" && \
+       execute_compose_command "up -d --force-recreate --remove-orphans" "$SERVICE_NAME"; then
+        echo "Service '$SERVICE_NAME' redeployed successfully."
+        return 0
+    else
+        echo "Failed to redeploy service '$SERVICE_NAME'." >&2
+        return 1
+    fi
+}
+
+restart_single_service() {
+    if ! select_service; then
+        return 1 # User cancelled or no services found
+    fi
+    echo "Restarting service: $SERVICE_NAME..."
+
+    if execute_compose_command "restart" "$SERVICE_NAME"; then
+        echo "Service '$SERVICE_NAME' restarted successfully."
+        return 0
+    else
+        echo "Failed to restart service '$SERVICE_NAME'." >&2
+        return 1
+    fi
+}
+
+service_shell() {
+    if ! select_service; then
+        return 1 # User cancelled or no services found
+    fi
+    echo "Accessing shell for service: $SERVICE_NAME..."
+
+    # Direct execution of docker compose exec as it's interactive
+    local base_cmd
+    base_cmd=$(compose_cmd)
+    if ! eval "$base_cmd exec -ti $SERVICE_NAME sh"; then
+        echo "Failed to access shell for service '$SERVICE_NAME'." >&2
+        return 1
+    fi
+    return 0
+}
+
+service_logs() {
+    if ! select_service; then
+        return 1 # User cancelled or no services found
+    fi
+    echo "Displaying logs for service: $SERVICE_NAME..."
+
+    # Use DOCKER_HOST directly with docker logs
+    if ! docker logs "$SERVICE_NAME"; then
+        echo "Failed to retrieve logs for service '$SERVICE_NAME'." >&2
+        return 1
+    fi
+    return 0
+}
+
+live_service_log_viewer() {
+    if ! select_service; then
+        return 1 # User cancelled or no services found
+    fi
+    echo "Following live logs for service: $SERVICE_NAME (Press Ctrl+C to stop)..."
+
+    # docker logs -f already handles continuous following, no need for a while loop
+    # DOCKER_HOST is honored by docker logs
+    if ! docker logs --tail 0 -f "$SERVICE_NAME"; then
+        echo "Failed to follow logs for service '$SERVICE_NAME'." >&2
+        return 1
+    fi
+    return 0
+}
+
+undeploy_all_services() {
+    echo "Undeploying all services..."
+
+    if execute_compose_command "down -v"; then
+        echo "All services undeployed successfully."
+        return 0
+    else
+        echo "Failed to undeploy all services." >&2
+        return 1
+    fi
+}
+
+undeploy_single_service() {
+    if ! select_service; then
+        return 1 # User cancelled or no services found
+    fi
+    echo "Undeploying service: $SERVICE_NAME..."
+
+    # Stop the service first
+    if ! execute_compose_command "stop" "$SERVICE_NAME"; then
+        echo "Failed to stop service '$SERVICE_NAME'. Attempting to remove anyway." >&2
+        # Don't return here, try to remove container even if stop failed
+    fi
+    echo "Service '$SERVICE_NAME' stopped."
+
+    # Remove the service container and its associated volumes
+    # Use -f for force removal, -v for removing volumes
+    if ! execute_compose_command "rm -f -v" "$SERVICE_NAME"; then
+        echo "Failed to remove service '$SERVICE_NAME'." >&2
+        return 1
+    fi
+    echo "Service '$SERVICE_NAME' undeployed (stopped and removed container/volumes)."
+    return 0
+}
+
+access_host_shell() {
+    # DOCKER_HOST contains the SSH_URI if selected, use that for direct ssh
+    if [ -z "${DOCKER_HOST:-}" ]; then
+        echo "Error: DOCKER_HOST is not set. Please select an SSH deployment method first." >&2
+        return 1
+    fi
+
+    # Check if DOCKER_HOST looks like an SSH URI
+    if [[ "$DOCKER_HOST" == *"@"* ]]; then
+        echo "Accessing host shell via SSH: $DOCKER_HOST..."
+        if ! ssh "$DOCKER_HOST"; then
+            echo "Failed to access host shell." >&2
+            return 1
+        fi
+    else
+        echo "Error: DOCKER_HOST ($DOCKER_HOST) does not appear to be an SSH URI." >&2
+        echo "Cannot access host shell directly." >&2
+        return 1
+    fi
+    return 0
+}
+
+# ==============================================================================
+# Database Management Functions (specific to PostgreSQL/PostGIS)
+# ==============================================================================
+
+# Common function for database commands
+execute_db_command() {
+    local command_description="$1"
+    local psql_command="$2"
+    local db_container="postgis" # Hardcoded container name for now
+    local db_user="postgresuser" # Hardcoded default user for psql exec
+
+    if [ -z "${SSH_URI:-}" ]; then
+        echo "Error: Cannot perform database operations without SSH_URI set for remote access." >&2
+        echo "Please ensure SSH_URI is set in your .env file and select an SSH deployment method." >&2
+        return 1
+    fi
+
+    echo "$command_description"
+    # Note: DB_NAME and DB_USER are expanded from the sourcing of the .env file.
+    local full_command="docker exec -i $db_container psql -U $db_user -d postgres -c \"$psql_command\""
+    if ! ssh "$SSH_URI" "$full_command"; then
+        echo "Error: Failed to execute database command for '$command_description'." >&2
+        return 1
+    fi
+    echo "$command_description complete."
+    return 0
+}
+
+
+setup_database() {
+    if [ -z "${DB_NAME:-}" ] || [ -z "${DB_USER:-}" ] || [ -z "${DB_PASS:-}" ]; then
+        echo "Error: Database name (DB_NAME), username (DB_USER), or password (DB_PASS) not set in environment variables." >&2
+        echo "Please set these in your .env file." >&2
+        return 1
+    fi
+
+    # Execute commands, returning on first failure
+    if ! execute_db_command "Create User $DB_USER" "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';"; then return 1; fi
+    if ! execute_db_command "Create Database $DB_NAME" "CREATE DATABASE $DB_NAME;"; then return 1; fi
+    if ! execute_db_command "Grant all privileges on database $DB_NAME to $DB_USER" "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;"; then return 1; fi
+    if ! execute_db_command "Grant USAGE on schema public to $DB_USER" "GRANT USAGE ON SCHEMA public TO $DB_USER;"; then return 1; fi
+    if ! execute_db_command "Grant CREATE on schema public to $DB_USER" "GRANT CREATE ON SCHEMA public TO $DB_USER;"; then return 1; fi
+    if ! execute_db_command "Grant all privileges on all sequences in schema public to $DB_USER" "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO $DB_USER;"; then return 1; fi
+    if ! execute_db_command "Alter default privileges on tables in schema public for $DB_USER" "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO $DB_USER;"; then return 1; fi
+    if ! execute_db_command "Alter default privileges on sequences in schema public for $DB_USER" "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO $DB_USER;"; then return 1; fi
+
+    echo "Database setup for $DB_NAME and user $DB_USER completed."
+    return 0
+}
+
+remove_database_user() {
+    if [ -z "${DB_USER:-}" ]; then
+        echo "Error: Database username (DB_USER) not set in environment variables." >&2
+        echo "Please set DB_USER in your .env file." >&2
+        return 1
+    fi
+
+    # Revoke privileges first (assuming database name matches the one the user has access to for safety)
+    # This command previously used 'favorites_db' and 'favorites_user' directly; it should use variables.
+    if [ -n "${DB_NAME:-}" ]; then
+        if ! execute_db_command "Revoke all privileges on database $DB_NAME from $DB_USER" "REVOKE ALL PRIVILEGES ON DATABASE $DB_NAME FROM $DB_USER;"; then
+            # Not a critical failure, user might have already dropped db or privileges
+            echo "Warning: Could not revoke privileges on database $DB_NAME from $DB_USER. Continuing with user drop." >&2
+        fi
+    fi
+
+    if ! execute_db_command "Drop User $DB_USER" "DROP USER IF EXISTS $DB_USER;"; then return 1; fi
+
+    echo "Database user $DB_USER removed."
+    return 0
+}
+
+# ==============================================================================
+# Main Menu
+# ==============================================================================
+
+# Function to show the main menu and execute the selected action
+show_main_menu() {
+    local options=(
+        "Deploy All Services" ""
+        "Redeploy Service" ""
+        "Restart Service" ""
+        "Undeploy Service" "" # New option
+        "Service Shell" ""
+        "Service Logs" ""
+        "Live Service Log Viewer" ""
+        "Undeploy All Services" ""
+        "Create External Networks" ""
+        "Setup Database Access" ""
+        "Remove database User" ""
+    )
+
+    # Add "Host Shell" option only if DOCKER_HOST is set to an SSH URI
+    if [ -n "${DOCKER_HOST:-}" ] && [[ "$DOCKER_HOST" == *"@"* ]]; then
+        options+=("Host Shell" "")
+    fi
+
+    local chosen_option
+    chosen_option=$(whiptail_menu "Main Menu" "Choose an action:" options)
+    local exit_status=$?
+
+    if [ "$exit_status" -ne 0 ]; then
+        echo "Main menu selection cancelled. Exiting."
+        exit 0 # Exit gracefully on cancel from main menu
+    fi
+
+    echo "" # Add a newline for better readability after menu exit
+
+    case "$chosen_option" in
+    "Deploy All Services") deploy_all_services ;;
+    "Redeploy Service") redeploy_single_service ;;
+    "Restart Service") restart_single_service ;;
+    "Undeploy Service") undeploy_single_service ;; # Call new function
+    "Service Shell") service_shell ;;
+    "Service Logs") service_logs ;;
+    "Live Service Log Viewer") live_service_log_viewer ;;
+    "Host Shell") access_host_shell ;;
+    "Undeploy All Services") undeploy_all_services ;;
+    "Create External Networks") create_external_networks ;;
+    "Setup Database Access") setup_database ;;
+    "Remove database User") remove_database_user ;;
+    *) echo "Unknown option: $chosen_option" >&2 ;;
+    esac
+}
+
+# ==============================================================================
+# Script Entry Point
+# ==============================================================================
+
+main() {
+    echo "Starting Docker Compose Management Script..."
+
+    # Select .env file
+    ENV_FILE=$(select_file "ENV" "./.env" "*.env")
+    if [ -z "$ENV_FILE" ]; then
+        echo "No .env file selected. Exiting." >&2
+        exit 1
+    fi
+    echo "Using ENV file: $ENV_FILE"
+    # Source the selected .env file — use set -a so all vars are exported to
+    # child processes (docker compose, envsubst) without explicit 'export' per var.
+    set -a
+    if ! source "$ENV_FILE"; then
+        echo "Error: Failed to source .env file: $ENV_FILE" >&2
+        exit 1
+    fi
+    set +a
+
+    # Select .yml file
+    YML_FILE=$(select_file "YML" "./docker-compose.yml" "*.yml")
+    if [ -z "$YML_FILE" ]; then
+        echo "No .yml file selected. Exiting." >&2
+        exit 1
+    fi
+    echo "Using YML file: $YML_FILE"
+
+    # Pre-substitute env vars into a temp compose file so Docker Compose
+    # receives concrete values rather than ${VAR} placeholders.
+    if ! prepare_temp_compose; then
+        echo "Failed to prepare temporary compose file." >&2
+        exit 1
+    fi
+
+    # Select deployment method
+    if ! select_deployment_method; then
+        exit 1 # Exit if user cancels deployment method selection
+    fi
+
+    # Show the main menu and execute the chosen action
+    show_main_menu
+    echo "Script finished."
+}
+
+# Execute the main function
+main
