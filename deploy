@@ -192,6 +192,11 @@ prepare_temp_compose() {
 
     envsubst "$var_list" < "$YML_FILE" > "$TEMP_YML_FILE"
 
+    # Escape bare $ signs in substituted values so Docker Compose doesn't
+    # try to interpolate them (e.g. passwords containing $X characters).
+    # Skips already-escaped $$ and ${ sequences.
+    sed -i 's/\$\([^{$]\)/$$\1/g' "$TEMP_YML_FILE"
+
     # Fail if any ${...} placeholders remain unresolved
     local unresolved
     unresolved=$(grep -o '\${[^}]*}' "$TEMP_YML_FILE" | sort -u || true)
