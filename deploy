@@ -404,6 +404,18 @@ undeploy_all_services() {
     fi
 }
 
+undeploy_all_services_keep_volumes() {
+    echo "Undeploying all services without removing volumes..."
+
+    if execute_compose_command "down"; then
+        echo "All services undeployed successfully. Volumes were kept."
+        return 0
+    else
+        echo "Failed to undeploy all services while keeping volumes." >&2
+        return 1
+    fi
+}
+
 undeploy_single_service() {
     if ! select_service; then
         return 1 # User cancelled or no services found
@@ -450,78 +462,6 @@ access_host_shell() {
 }
 
 # ==============================================================================
-# Database Management Functions (specific to PostgreSQL/PostGIS)
-# ==============================================================================
-
-# Common function for database commands
-execute_db_command() {
-    local command_description="$1"
-    local psql_command="$2"
-    local db_container="postgis" # Hardcoded container name for now
-    local db_user="postgresuser" # Hardcoded default user for psql exec
-
-    if [ -z "${SSH_URI:-}" ]; then
-        echo "Error: Cannot perform database operations without SSH_URI set for remote access." >&2
-        echo "Please ensure SSH_URI is set in your .env file and select an SSH deployment method." >&2
-        return 1
-    fi
-
-    echo "$command_description"
-    # Note: DB_NAME and DB_USER are expanded from the sourcing of the .env file.
-    local full_command="docker exec -i $db_container psql -U $db_user -d postgres -c \"$psql_command\""
-    if ! ssh "$SSH_URI" "$full_command"; then
-        echo "Error: Failed to execute database command for '$command_description'." >&2
-        return 1
-    fi
-    echo "$command_description complete."
-    return 0
-}
-
-
-setup_database() {
-    if [ -z "${DB_NAME:-}" ] || [ -z "${DB_USER:-}" ] || [ -z "${DB_PASS:-}" ]; then
-        echo "Error: Database name (DB_NAME), username (DB_USER), or password (DB_PASS) not set in environment variables." >&2
-        echo "Please set these in your .env file." >&2
-        return 1
-    fi
-
-    # Execute commands, returning on first failure
-    if ! execute_db_command "Create User $DB_USER" "CREATE USER $DB_USER WITH PASSWORD '$DB_PASS';"; then return 1; fi
-    if ! execute_db_command "Create Database $DB_NAME" "CREATE DATABASE $DB_NAME;"; then return 1; fi
-    if ! execute_db_command "Grant all privileges on database $DB_NAME to $DB_USER" "GRANT ALL PRIVILEGES ON DATABASE $DB_NAME TO $DB_USER;"; then return 1; fi
-    if ! execute_db_command "Grant USAGE on schema public to $DB_USER" "GRANT USAGE ON SCHEMA public TO $DB_USER;"; then return 1; fi
-    if ! execute_db_command "Grant CREATE on schema public to $DB_USER" "GRANT CREATE ON SCHEMA public TO $DB_USER;"; then return 1; fi
-    if ! execute_db_command "Grant all privileges on all sequences in schema public to $DB_USER" "GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO $DB_USER;"; then return 1; fi
-    if ! execute_db_command "Alter default privileges on tables in schema public for $DB_USER" "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO $DB_USER;"; then return 1; fi
-    if ! execute_db_command "Alter default privileges on sequences in schema public for $DB_USER" "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO $DB_USER;"; then return 1; fi
-
-    echo "Database setup for $DB_NAME and user $DB_USER completed."
-    return 0
-}
-
-remove_database_user() {
-    if [ -z "${DB_USER:-}" ]; then
-        echo "Error: Database username (DB_USER) not set in environment variables." >&2
-        echo "Please set DB_USER in your .env file." >&2
-        return 1
-    fi
-
-    # Revoke privileges first (assuming database name matches the one the user has access to for safety)
-    # This command previously used 'favorites_db' and 'favorites_user' directly; it should use variables.
-    if [ -n "${DB_NAME:-}" ]; then
-        if ! execute_db_command "Revoke all privileges on database $DB_NAME from $DB_USER" "REVOKE ALL PRIVILEGES ON DATABASE $DB_NAME FROM $DB_USER;"; then
-            # Not a critical failure, user might have already dropped db or privileges
-            echo "Warning: Could not revoke privileges on database $DB_NAME from $DB_USER. Continuing with user drop." >&2
-        fi
-    fi
-
-    if ! execute_db_command "Drop User $DB_USER" "DROP USER IF EXISTS $DB_USER;"; then return 1; fi
-
-    echo "Database user $DB_USER removed."
-    return 0
-}
-
-# ==============================================================================
 # Main Menu
 # ==============================================================================
 
@@ -536,9 +476,8 @@ show_main_menu() {
         "Service Logs" ""
         "Live Service Log Viewer" ""
         "Undeploy All Services" ""
+        "Undeploy All Services (Keep Volumes)" ""
         "Create External Networks" ""
-        "Setup Database Access" ""
-        "Remove database User" ""
     )
 
     # Add "Host Shell" option only if DOCKER_HOST is set to an SSH URI
@@ -564,9 +503,8 @@ show_main_menu() {
     "Live Service Log Viewer") live_service_log_viewer ;;
     "Host Shell") access_host_shell ;;
     "Undeploy All Services") undeploy_all_services ;;
+    "Undeploy All Services (Keep Volumes)") undeploy_all_services_keep_volumes ;;
     "Create External Networks") create_external_networks ;;
-    "Setup Database Access") setup_database ;;
-    "Remove database User") remove_database_user ;;
     *) echo "Unknown option: $chosen_option" >&2 ;;
     esac
 }

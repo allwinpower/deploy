@@ -38,10 +38,9 @@ On launch the script walks you through three interactive prompts:
 | Service Shell             | Opens an interactive `sh` shell inside a selected container         |
 | Service Logs              | Prints logs for a selected service                                  |
 | Live Service Log Viewer   | Tails live logs for a selected service (`Ctrl+C` to stop)           |
-| Undeploy All Services     | Runs `docker compose down -v` to remove all containers and volumes  |
+| Undeploy All Services     | Runs `docker compose down -v` to remove all containers and Compose-managed volumes |
+| Undeploy All Services (Keep Volumes) | Runs `docker compose down` to remove containers and networks but keep volumes |
 | Create External Networks  | Creates any external Docker networks declared in the compose file   |
-| Setup Database Access     | Creates a PostgreSQL user and database via SSH (requires `SSH_URI`) |
-| Remove Database User      | Drops the PostgreSQL user (revokes privileges first)                |
 | Host Shell                | Opens an SSH session to the remote host (only shown for SSH targets)|
 
 ## Environment File
@@ -51,9 +50,6 @@ The `.env` file is sourced with `set -a` so all variables are automatically expo
 | Variable   | Purpose                                                          |
 |------------|------------------------------------------------------------------|
 | `SSH_URI`  | Remote host in `user@host` format; enables SSH deployment options |
-| `DB_NAME`  | PostgreSQL database name (used by database management functions) |
-| `DB_USER`  | PostgreSQL username                                              |
-| `DB_PASS`  | PostgreSQL password                                              |
 
 Variables defined in the `.env` file are substituted into a temporary copy of the compose file before any Docker Compose command runs. The renderer supports `${VAR}`, `${VAR:?message}`, and `${VAR:-default}` forms, errors out if required values are missing, and reports missing env/compose candidates or cancelled selections cleanly instead of exiting abruptly.
 
