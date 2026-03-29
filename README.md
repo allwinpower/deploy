@@ -53,6 +53,7 @@ Supported flags:
 - `-h`, `--help` show help output and exit
 - `-i`, `--install` install the current `deploy` binary into a user executable path and exit
 - `-p`, `--profile` set `COMPOSE_PROFILES`
+- `-u`, `--update` update `deploy` to the latest stable release and exit
 - `-e`, `--env` preselect the env file
 - `-f`, `--file` preselect the compose file
 - `-v`, `--version` show the binary version and exit
@@ -63,6 +64,7 @@ Examples:
 ./deploy --help
 ./deploy --install
 ./deploy -i
+./deploy --update
 ./deploy prod
 ./deploy -p prod
 ./deploy -e .env.prod -f compose.yml
@@ -72,6 +74,10 @@ Examples:
 ## Install
 
 `deploy --install` and `deploy -i` both install the currently running binary into a user-scoped executable directory without `sudo`, then exit.
+
+Released builds also check once per day for a newer stable GitHub Release when the CLI starts. If one is available, `deploy` offers to download and install it before continuing.
+
+`deploy --update` and `deploy -u` skip the normal app flow, install the latest stable release immediately, and then exit.
 
 The installer uses the first writable user-owned directory already on `PATH`. If none exists, it falls back to:
 
@@ -149,8 +155,8 @@ That workflow:
 
 - runs `go test ./...`
 - builds the release binaries with the tag embedded as the CLI version
-- packages release assets for Linux, macOS, and Windows
-- uploads those assets plus `checksums.txt` to the GitHub Release page
+- uploads direct binary assets for Linux, macOS, and Windows
+- uploads `checksums.txt` so downloads can be verified and used by the built-in updater
 
 ## How It Works
 

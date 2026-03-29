@@ -256,6 +256,16 @@ func TestParseCLIArgsHelpAndConflicts(t *testing.T) {
 		}
 	})
 
+	t.Run("update", func(t *testing.T) {
+		options, err := parseCLIArgs([]string{"--update"})
+		if err != nil {
+			t.Fatalf("parseCLIArgs returned error: %v", err)
+		}
+		if !options.update {
+			t.Fatal("expected update flag to be set")
+		}
+	})
+
 	t.Run("conflicting profile values", func(t *testing.T) {
 		if _, err := parseCLIArgs([]string{"--profile", "prod", "dev"}); err == nil {
 			t.Fatal("expected conflicting profile values to return an error")
@@ -305,6 +315,24 @@ func TestParseCLIArgsHelpAndConflicts(t *testing.T) {
 			t.Fatal("expected install/positional profile conflict to return an error")
 		}
 	})
+
+	t.Run("update conflicts with profile flag", func(t *testing.T) {
+		if _, err := parseCLIArgs([]string{"--update", "--profile", "prod"}); err == nil {
+			t.Fatal("expected update/profile conflict to return an error")
+		}
+	})
+
+	t.Run("update conflicts with positional profile", func(t *testing.T) {
+		if _, err := parseCLIArgs([]string{"--update", "prod"}); err == nil {
+			t.Fatal("expected update/positional profile conflict to return an error")
+		}
+	})
+
+	t.Run("update conflicts with version", func(t *testing.T) {
+		if _, err := parseCLIArgs([]string{"--update", "--version"}); err == nil {
+			t.Fatal("expected update/version conflict to return an error")
+		}
+	})
 }
 
 func TestValidateInputFile(t *testing.T) {
@@ -336,8 +364,8 @@ func TestPrintUsage(t *testing.T) {
 	if !strings.Contains(text, "deploy [flags]") {
 		t.Fatalf("expected usage text to mention flags, got %q", text)
 	}
-	if !strings.Contains(text, "--profile") || !strings.Contains(text, "--help") || !strings.Contains(text, "--install") || !strings.Contains(text, "--version") {
-		t.Fatalf("expected usage text to mention help, profile, install, and version flags, got %q", text)
+	if !strings.Contains(text, "--profile") || !strings.Contains(text, "--help") || !strings.Contains(text, "--install") || !strings.Contains(text, "--version") || !strings.Contains(text, "--update") {
+		t.Fatalf("expected usage text to mention help, profile, install, version, and update flags, got %q", text)
 	}
 }
 

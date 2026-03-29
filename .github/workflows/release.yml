@@ -30,7 +30,7 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: bash ./build.sh
 
-      - name: Package release assets
+      - name: Prepare release assets
         env:
           VERSION: ${{ github.ref_name }}
         run: |
@@ -38,13 +38,10 @@ jobs:
 
           mkdir -p release-assets
 
-          tar -C dist/linux -czf "release-assets/deploy_${VERSION}_linux_amd64.tar.gz" deploy
-          tar -C dist/macos-amd64 -czf "release-assets/deploy_${VERSION}_darwin_amd64.tar.gz" deploy
-          tar -C dist/macos-arm64 -czf "release-assets/deploy_${VERSION}_darwin_arm64.tar.gz" deploy
-          (
-            cd dist/windows
-            zip -9 "../../release-assets/deploy_${VERSION}_windows_amd64.zip" deploy.exe
-          )
+          cp dist/linux/deploy "release-assets/deploy_${VERSION}_linux_amd64"
+          cp dist/macos-amd64/deploy "release-assets/deploy_${VERSION}_darwin_amd64"
+          cp dist/macos-arm64/deploy "release-assets/deploy_${VERSION}_darwin_arm64"
+          cp dist/windows/deploy.exe "release-assets/deploy_${VERSION}_windows_amd64.exe"
 
           (
             cd release-assets

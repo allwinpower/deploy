@@ -73,6 +73,7 @@ type cliOptions struct {
 	envFile     string
 	composeFile string
 	install     bool
+	update      bool
 	showHelp    bool
 	showVersion bool
 }
@@ -111,6 +112,10 @@ func main() {
 }
 
 func (a *app) run(args []string) error {
+	if len(args) > 0 && args[0] == internalWindowsReplaceCommand {
+		return runWindowsReplaceHelper(args[1:])
+	}
+
 	options, err := parseCLIArgs(args)
 	if err != nil {
 		a.printUsage(a.stderr)
@@ -126,6 +131,14 @@ func (a *app) run(args []string) error {
 	}
 	if options.install {
 		return a.installSelf()
+	}
+	if options.update {
+		return a.runSelfUpdate()
+	}
+	if handled, err := a.checkForStartupUpdate(); err != nil {
+		return err
+	} else if handled {
+		return nil
 	}
 
 	fmt.Fprintln(a.stdout, "Starting Docker Compose Management Script...")
@@ -231,6 +244,7 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	var envFlag stringFlag
 	var fileFlag stringFlag
 	var install bool
+	var update bool
 	var help bool
 	var showVersion bool
 
@@ -244,6 +258,8 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	flagSet.Var(&fileFlag, "file", "")
 	flagSet.BoolVar(&install, "i", false, "")
 	flagSet.BoolVar(&install, "install", false, "")
+	flagSet.BoolVar(&update, "u", false, "")
+	flagSet.BoolVar(&update, "update", false, "")
 	flagSet.BoolVar(&help, "h", false, "")
 	flagSet.BoolVar(&help, "help", false, "")
 	flagSet.BoolVar(&showVersion, "v", false, "")
@@ -272,6 +288,9 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	if install {
 		options.install = true
 	}
+	if update {
+		options.update = true
+	}
 
 	remaining := flagSet.Args()
 	if options.install {
@@ -286,6 +305,27 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 		}
 		if len(remaining) > 0 {
 			return options, errors.New("--install cannot be combined with a positional profile")
+		}
+		return options, nil
+	}
+	if options.update {
+		if profileFlag.set {
+			return options, errors.New("--update cannot be combined with --profile")
+		}
+		if envFlag.set {
+			return options, errors.New("--update cannot be combined with --env")
+		}
+		if fileFlag.set {
+			return options, errors.New("--update cannot be combined with --file")
+		}
+		if options.install {
+			return options, errors.New("--update cannot be combined with --install")
+		}
+		if options.showVersion {
+			return options, errors.New("--update cannot be combined with --version")
+		}
+		if len(remaining) > 0 {
+			return options, errors.New("--update cannot be combined with a positional profile")
 		}
 		return options, nil
 	}
@@ -318,6 +358,7 @@ func (a *app) printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -h, --help             Show help and exit")
 	fmt.Fprintln(w, "  -i, --install          Install deploy into a user executable path and exit")
 	fmt.Fprintln(w, "  -p, --profile NAME     Set COMPOSE_PROFILES (default: dev)")
+	fmt.Fprintln(w, "  -u, --update           Update deploy to the latest stable release and exit")
 	fmt.Fprintln(w, "  -e, --env PATH         Preselect the env file")
 	fmt.Fprintln(w, "  -f, --file PATH        Preselect the compose file")
 	fmt.Fprintln(w, "  -v, --version          Show version and exit")
@@ -329,6 +370,7 @@ func (a *app) printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Examples:")
 	fmt.Fprintln(w, "  deploy")
 	fmt.Fprintln(w, "  deploy --install")
+	fmt.Fprintln(w, "  deploy --update")
 	fmt.Fprintln(w, "  deploy prod")
 	fmt.Fprintln(w, "  deploy --profile prod")
 	fmt.Fprintln(w, "  deploy -e .env.prod -f compose.yml")
@@ -340,18 +382,9 @@ func versionString() string {
 }
 
 func (a *app) installSelf() error {
-	sourcePath, err := os.Executable()
+	resolvedSource, err := currentExecutablePath()
 	if err != nil {
-		return fmt.Errorf("failed to resolve current executable: %w", err)
-	}
-
-	resolvedSource, err := filepath.EvalSymlinks(sourcePath)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			resolvedSource = sourcePath
-		} else {
-			return fmt.Errorf("failed to resolve executable symlink: %w", err)
-		}
+		return err
 	}
 
 	target, err := resolveInstallTarget(runtime.GOOS, currentEnvironment(), os.Getenv("PATH"), isDirWritable)
