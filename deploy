@@ -148,13 +148,17 @@ select_deployment_method() {
     local menu_options=()
     local ssh_uri="${SSH_URI:-}"
 
-    # Only add SSH_URI option if it's set in the .env file
-    if [ -n "$ssh_uri" ]; then
-        methods+=("$ssh_uri")
+    if [ -z "$ssh_uri" ]; then
+        whiptail_msgbox \
+            "SSH_URI Not Set" \
+            "The selected env file does not set SSH_URI. Only local deployment is allowed."
+        unset DOCKER_HOST
+        echo "Selected deployment method: Locally"
+        return 0
     fi
 
-    # Add other options
-    methods+=("Locally" "Custom SSH Connection")
+    # Add supported options when SSH_URI is configured.
+    methods+=("$ssh_uri" "Locally")
 
     for method in "${methods[@]}"; do
         menu_options+=("$method" "")
@@ -174,19 +178,6 @@ select_deployment_method() {
     "Locally")
         unset DOCKER_HOST # Ensure DOCKER_HOST is not set for local
         echo "Selected deployment method: Locally"
-        ;;
-    "Custom SSH Connection")
-        local custom_ssh_uri
-        if ! custom_ssh_uri=$(whiptail --inputbox "Enter SSH URI (user@server):" 8 78 "" 3>&1 1>&2 2>&3); then
-            echo "Custom SSH URI input cancelled. Exiting." >&2
-            return 1
-        fi
-        if [ -z "$custom_ssh_uri" ]; then
-            echo "No SSH URI entered. Exiting." >&2
-            return 1
-        fi
-        export DOCKER_HOST="$custom_ssh_uri"
-        echo "Selected deployment method: Custom SSH URI ($custom_ssh_uri)"
         ;;
     esac
     return 0
@@ -492,6 +483,11 @@ show_main_menu() {
         "Create External Networks" ""
     )
 
+    # Show Host Shell as unavailable when the env does not support SSH deployment.
+    if [ -z "${SSH_URI:-}" ]; then
+        options+=("Host Shell (Unavailable)" "")
+    fi
+
     # Add "Host Shell" option only if DOCKER_HOST is set to an SSH URI
     if [ -n "${DOCKER_HOST:-}" ] && [[ "$DOCKER_HOST" == *"@"* ]]; then
         options+=("Host Shell" "")
@@ -514,6 +510,11 @@ show_main_menu() {
     "Service Logs") service_logs ;;
     "Live Service Log Viewer") live_service_log_viewer ;;
     "Host Shell") access_host_shell ;;
+    "Host Shell (Unavailable)")
+        whiptail_msgbox \
+            "Host Shell Unavailable" \
+            "Host Shell requires SSH deployment. This env file does not set SSH_URI, so only local deployment is allowed."
+        ;;
     "Undeploy All Services") undeploy_all_services ;;
     "Undeploy All Services (Keep Volumes)") undeploy_all_services_keep_volumes ;;
     "Create External Networks") create_external_networks ;;
