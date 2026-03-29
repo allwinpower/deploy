@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -203,6 +205,131 @@ func TestCheckForStartupUpdateUsesCachedResultAndStoresDecline(t *testing.T) {
 	}
 }
 
+func TestFetchLatestReleaseRetriesTimeoutAndSucceeds(t *testing.T) {
+	restore := overrideUpdateGlobals()
+	defer restore()
+
+	updateSleep = func(time.Duration) {}
+
+	attempts := 0
+	updateHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, &timeoutError{err: context.DeadlineExceeded}
+			}
+			body := `{"tag_name":"v1.1.0","assets":[]}`
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       ioNopCloser(strings.NewReader(body)),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	release, err := newUpdater(&app{}).fetchLatestRelease()
+	if err != nil {
+		t.Fatalf("fetchLatestRelease returned error: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempts)
+	}
+	if release.TagName != "v1.1.0" {
+		t.Fatalf("unexpected release tag %q", release.TagName)
+	}
+}
+
+func TestRunSelfUpdateReturnsClearTimeoutError(t *testing.T) {
+	restore := overrideUpdateGlobals()
+	defer restore()
+
+	updateSleep = func(time.Duration) {}
+	updateHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, &timeoutError{err: context.DeadlineExceeded}
+		}),
+	}
+
+	previousVersion := version
+	version = "v1.0.0"
+	defer func() {
+		version = previousVersion
+	}()
+
+	err := (&app{
+		reader: bufio.NewReader(strings.NewReader("")),
+		stdout: &strings.Builder{},
+		stderr: &strings.Builder{},
+	}).run([]string{"--update"})
+	if err == nil {
+		t.Fatal("expected --update to return an error")
+	}
+	if !strings.Contains(err.Error(), "timed out contacting GitHub for release metadata after 3 attempts") {
+		t.Fatalf("unexpected timeout error %q", err)
+	}
+}
+
+func TestStartupUpdateIgnoresNetworkFailure(t *testing.T) {
+	restore := overrideUpdateGlobals()
+	defer restore()
+
+	updateSleep = func(time.Duration) {}
+	updateHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, &timeoutError{err: context.DeadlineExceeded}
+		}),
+	}
+
+	previousVersion := version
+	version = "v1.0.0"
+	defer func() {
+		version = previousVersion
+	}()
+
+	handled, err := (&app{
+		reader: bufio.NewReader(strings.NewReader("")),
+		stdout: &strings.Builder{},
+		stderr: &strings.Builder{},
+	}).checkForStartupUpdate()
+	if err != nil {
+		t.Fatalf("checkForStartupUpdate returned error: %v", err)
+	}
+	if handled {
+		t.Fatal("did not expect startup update check to exit the app")
+	}
+}
+
+func TestFetchLatestReleaseDoesNotRetryNotFound(t *testing.T) {
+	restore := overrideUpdateGlobals()
+	defer restore()
+
+	updateSleep = func(time.Duration) {}
+	attempts := 0
+	updateHTTPClient = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			attempts++
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Status:     "404 Not Found",
+				Body:       ioNopCloser(strings.NewReader("missing")),
+				Header:     make(http.Header),
+			}, nil
+		}),
+	}
+
+	_, err := newUpdater(&app{}).fetchLatestRelease()
+	if err == nil {
+		t.Fatal("expected fetchLatestRelease to fail")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected 1 attempt for non-retryable status, got %d", attempts)
+	}
+	if !strings.Contains(err.Error(), "failed to download release metadata: 404 Not Found") {
+		t.Fatalf("unexpected not found error %q", err)
+	}
+}
+
 func overrideUpdateGlobals() func() {
 	previousReleaseURL := updateLatestReleaseURL
 	previousClock := updateClock
@@ -212,6 +339,7 @@ func overrideUpdateGlobals() func() {
 	previousExecutable := updateExecutable
 	previousPathValue := updatePathValue
 	previousCanWriteDir := updateCanWriteDir
+	previousSleep := updateSleep
 
 	return func() {
 		updateLatestReleaseURL = previousReleaseURL
@@ -222,5 +350,42 @@ func overrideUpdateGlobals() func() {
 		updateExecutable = previousExecutable
 		updatePathValue = previousPathValue
 		updateCanWriteDir = previousCanWriteDir
+		updateSleep = previousSleep
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
+type timeoutError struct {
+	err error
+}
+
+func (e *timeoutError) Error() string {
+	if e.err == nil {
+		return "timeout"
+	}
+	return e.err.Error()
+}
+
+func (e *timeoutError) Timeout() bool {
+	return true
+}
+
+func (e *timeoutError) Temporary() bool {
+	return true
+}
+
+func (e *timeoutError) Unwrap() error {
+	if e.err == nil {
+		return context.DeadlineExceeded
+	}
+	return e.err
+}
+
+func ioNopCloser(reader *strings.Reader) io.ReadCloser {
+	return io.NopCloser(reader)
 }

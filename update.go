@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,6 +21,9 @@ import (
 
 const (
 	updateCheckTTL                = 24 * time.Hour
+	updateRequestTimeout          = 20 * time.Second
+	updateMaxAttempts             = 3
+	updateRetryDelay              = 2 * time.Second
 	checksumsAssetName            = "checksums.txt"
 	internalWindowsReplaceCommand = "__replace-binary"
 )
@@ -27,11 +32,12 @@ var (
 	updateLatestReleaseURL = "https://api.github.com/repos/allwinpower/deploy/releases/latest"
 	updateClock            = time.Now
 	updateCacheRoot        = os.UserCacheDir
-	updateHTTPClient       = &http.Client{Timeout: 5 * time.Second}
+	updateHTTPClient       = &http.Client{Timeout: updateRequestTimeout}
 	updateEnvironment      = currentEnvironment
 	updateExecutable       = currentExecutablePath
 	updatePathValue        = func() string { return os.Getenv("PATH") }
 	updateCanWriteDir      = isDirWritable
+	updateSleep            = time.Sleep
 )
 
 type githubRelease struct {
@@ -314,25 +320,12 @@ func currentExecutablePath() (string, error) {
 }
 
 func (u *updater) fetchLatestRelease() (githubRelease, error) {
-	req, err := http.NewRequest(http.MethodGet, updateLatestReleaseURL, nil)
+	body, err := u.getURLBytes(updateLatestReleaseURL, "release metadata", "application/vnd.github+json")
 	if err != nil {
 		return githubRelease{}, err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("User-Agent", "deploy/"+version)
-
-	resp, err := u.client.Do(req)
-	if err != nil {
-		return githubRelease{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return githubRelease{}, fmt.Errorf("failed to fetch latest release: %s", resp.Status)
-	}
-
 	var release githubRelease
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := json.Unmarshal(body, &release); err != nil {
 		return githubRelease{}, err
 	}
 	if release.Prerelease {
@@ -388,23 +381,7 @@ func releaseAssetName(version, goos, goarch string) (string, error) {
 }
 
 func (u *updater) downloadText(url string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "deploy/"+version)
-
-	resp, err := u.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to download %s: %s", url, resp.Status)
-	}
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := u.getURLBytes(url, "release checksums", "")
 	if err != nil {
 		return "", err
 	}
@@ -413,20 +390,9 @@ func (u *updater) downloadText(url string) (string, error) {
 }
 
 func (u *updater) downloadAssetToTemp(asset releaseAsset) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, asset.BrowserDownloadURL, nil)
+	body, err := u.getURLBytes(asset.BrowserDownloadURL, asset.Name, "")
 	if err != nil {
 		return "", err
-	}
-	req.Header.Set("User-Agent", "deploy/"+version)
-
-	resp, err := u.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to download %s: %s", asset.Name, resp.Status)
 	}
 
 	file, err := os.CreateTemp("", "deploy-update-*")
@@ -435,7 +401,7 @@ func (u *updater) downloadAssetToTemp(asset releaseAsset) (string, error) {
 	}
 	defer file.Close()
 
-	if _, err := io.Copy(file, resp.Body); err != nil {
+	if _, err := file.Write(body); err != nil {
 		_ = os.Remove(file.Name())
 		return "", err
 	}
@@ -529,6 +495,66 @@ func (u *updater) saveCache(state updateCacheState) error {
 	return os.WriteFile(path, data, 0o644)
 }
 
+func (u *updater) getURLBytes(url, description, accept string) ([]byte, error) {
+	var lastErr error
+	var timeout bool
+
+	for attempt := 1; attempt <= updateMaxAttempts; attempt++ {
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		req.Header.Set("User-Agent", "deploy/"+version)
+
+		resp, err := u.client.Do(req)
+		if err != nil {
+			lastErr = err
+			timeout = timeout || isTimeoutError(err)
+			if !isRetryableNetworkError(err) || attempt == updateMaxAttempts {
+				break
+			}
+			updateSleep(updateRetryDelay)
+			continue
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			if attempt == updateMaxAttempts {
+				break
+			}
+			updateSleep(updateRetryDelay)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("%s", resp.Status)
+			if !isRetryableHTTPStatus(resp.StatusCode) || attempt == updateMaxAttempts {
+				break
+			}
+			updateSleep(updateRetryDelay)
+			continue
+		}
+
+		return body, nil
+	}
+
+	if lastErr == nil {
+		lastErr = errors.New("request failed")
+	}
+	if timeout {
+		return nil, fmt.Errorf("timed out contacting GitHub for %s after %d attempts: %w", description, updateMaxAttempts, lastErr)
+	}
+	if isRetryableNetworkError(lastErr) {
+		return nil, fmt.Errorf("failed to download %s after %d attempts: %w", description, updateMaxAttempts, lastErr)
+	}
+	return nil, fmt.Errorf("failed to download %s: %w", description, lastErr)
+}
+
 func isTaggedReleaseVersion(value string) bool {
 	_, err := parseSemver(value)
 	return err == nil
@@ -586,6 +612,38 @@ func compareInts(left, right int) int {
 		return 1
 	default:
 		return 0
+	}
+}
+
+func isRetryableNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isTimeoutError(err) {
+		return true
+	}
+
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isRetryableHTTPStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusInternalServerError:
+		return true
+	default:
+		return false
 	}
 }
 
