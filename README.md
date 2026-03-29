@@ -99,8 +99,8 @@ On launch the CLI opens an interactive terminal UI and walks through the same fl
 
 | Action | Description |
 |--------|-------------|
-| Deploy All Services | Builds all images and starts all containers with `up -d --force-recreate --remove-orphans` |
-| Redeploy Service | Rebuilds and restarts one selected service |
+| Deploy All Services | Rebuilds all images with `docker compose build --no-cache` and starts all containers with `up -d --force-recreate --remove-orphans` |
+| Redeploy Service | Rebuilds one selected service with `docker compose build --no-cache <service>` and restarts it |
 | Restart Service | Restarts one selected service without rebuilding |
 | Undeploy Service | Stops and removes one selected service and its volumes |
 | Service Shell | Opens an interactive `sh` shell inside one selected service |
@@ -166,5 +166,6 @@ That workflow:
 4. A warning is shown if the raw compose file still contains a top-level `version` key.
 5. The resolved compose `name` must exist and exactly match env `PROJECT`.
 6. If `SSH_URI` is set, the user can choose between local deployment and the configured remote Docker host.
-7. All Compose actions run directly against the selected compose file and env file; no temporary compose file is generated.
-8. The Host Shell action uses the local `ssh` client, so it follows your existing SSH config, agent state, and identity selection.
+7. Deploy and redeploy actions rebuild with `--no-cache` by default so remote hosts do not reuse stale image layers for production assets.
+8. All Compose actions run directly against the selected compose file and env file; no temporary compose file is generated.
+9. The Host Shell action uses the local `ssh` client, so it follows your existing SSH config, agent state, and identity selection.

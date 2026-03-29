@@ -488,7 +488,7 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 		if err := a.createExternalNetworks(ctx, composeEnv); err != nil {
 			return err
 		}
-		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "build"); err != nil {
+		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, composeBuildArgs("")...); err != nil {
 			return err
 		}
 		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "up", "-d", "--force-recreate", "--remove-orphans")
@@ -498,7 +498,7 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 			return err
 		}
 		fmt.Fprintf(a.stdout, "Redeploying service: %s...\n", service)
-		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "build", service); err != nil {
+		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, composeBuildArgs(service)...); err != nil {
 			return err
 		}
 		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "up", "-d", "--force-recreate", "--remove-orphans", service)
@@ -1512,6 +1512,15 @@ func externalNetworkNames(model composeModel) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func composeBuildArgs(service string) []string {
+	args := []string{"build", "--no-cache"}
+	service = strings.TrimSpace(service)
+	if service != "" {
+		args = append(args, service)
+	}
+	return args
 }
 
 func runDockerCompose(env []string, envFile, composeFile string, interactive bool, args ...string) error {

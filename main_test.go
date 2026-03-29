@@ -200,6 +200,24 @@ func TestBuildSystemSSHArgs(t *testing.T) {
 	}
 }
 
+func TestComposeBuildArgs(t *testing.T) {
+	t.Run("all services", func(t *testing.T) {
+		got := composeBuildArgs("")
+		want := []string{"build", "--no-cache"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("unexpected build args: got %#v want %#v", got, want)
+		}
+	})
+
+	t.Run("single service", func(t *testing.T) {
+		got := composeBuildArgs("web")
+		want := []string{"build", "--no-cache", "web"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("unexpected build args: got %#v want %#v", got, want)
+		}
+	})
+}
+
 func TestParseCLIArgsDefaults(t *testing.T) {
 	options, err := parseCLIArgs(nil)
 	if err != nil {
