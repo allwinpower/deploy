@@ -23,8 +23,8 @@ An interactive terminal UI script for managing Docker Compose deployments — lo
 
 On launch the script walks you through three interactive prompts:
 
-1. **Select `.env` file** — scans the current directory (up to 2 levels deep) for `*.env` files
-2. **Select `.yml` file** — scans for `*.yml` files; defaults to `./docker-compose.yml`
+1. **Select `.env` file** — scans the current directory (up to 2 levels deep) for `*.env` and `.env.*` files; prefers `./.env`
+2. **Select compose file** — scans for both `*.yml` and `*.yaml` files; prefers `./docker-compose.yml`, `./docker-compose.yaml`, `./compose.yml`, then `./compose.yaml`
 3. **Select deployment method** — local Docker daemon, a pre-configured `SSH_URI` from your env file, or a custom SSH connection
 
 ## Main Menu Actions
@@ -55,7 +55,7 @@ The `.env` file is sourced with `set -a` so all variables are automatically expo
 | `DB_USER`  | PostgreSQL username                                              |
 | `DB_PASS`  | PostgreSQL password                                              |
 
-Variables defined in the `.env` file are substituted into a temporary copy of the compose file via `envsubst` before any Docker Compose command runs. The script errors out if any `${VAR}` placeholders remain unresolved after substitution.
+Variables defined in the `.env` file are substituted into a temporary copy of the compose file before any Docker Compose command runs. The renderer supports `${VAR}`, `${VAR:?message}`, and `${VAR:-default}` forms, errors out if required values are missing, and reports missing env/compose candidates or cancelled selections cleanly instead of exiting abruptly.
 
 ## How It Works
 

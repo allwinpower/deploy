@@ -43,25 +43,40 @@ whiptail_menu() {
 }
 
 # Generic function to find files and present a select menu
-# Args: file_type (e.g., "ENV", "YML"), default_file, search_pattern
+# Args: file_type (e.g., "ENV", "Compose"), default_files_array, search_patterns_array
 # Returns: selected_file_path or empty string on cancel
 select_file() {
     local file_type="$1"
-    local default_file="$2"
-    local search_pattern="$3"
+    local -n default_files_ref=$2
+    local -n search_patterns_ref=$3
 
     local files=()
-    # Add default file if it exists and is a regular file
-    if [[ -f "$default_file" ]]; then
-        files+=("$default_file")
-    fi
+    local -A seen_files=()
+    local file
+    local pattern
 
-    # Find other matching files, excluding the default, and add them
-    while IFS= read -r -d '' file; do
-        if [[ "$file" != "$default_file" ]]; then
+    # Add preferred defaults first so common filenames appear at the top.
+    for file in "${default_files_ref[@]}"; do
+        if [[ -f "$file" && -z "${seen_files[$file]+x}" ]]; then
             files+=("$file")
+            seen_files["$file"]=1
         fi
-    done < <(find . -maxdepth 2 -name "$search_pattern" -not -path "$default_file" -print0)
+    done
+
+    # Find other matching files while avoiding duplicates from the defaults list.
+    for pattern in "${search_patterns_ref[@]}"; do
+        while IFS= read -r -d '' file; do
+            if [[ -z "${seen_files[$file]+x}" ]]; then
+                files+=("$file")
+                seen_files["$file"]=1
+            fi
+        done < <(find . -maxdepth 2 -type f -name "$pattern" -print0)
+    done
+
+    if [ "${#files[@]}" -eq 0 ]; then
+        echo "No $file_type files found in $(pwd)." >&2
+        return 1
+    fi
 
     # Prepare menu options array
     local menu_options=()
@@ -72,14 +87,11 @@ select_file() {
     # Construct the title
     local title="Select $file_type File"
     local selected_file
-    selected_file=$(whiptail_menu "$title" "Choose a $file_type file:" menu_options)
-    local exit_status=$?
-
-    if [ "$exit_status" -ne 0 ]; then
-        echo "" # Return empty on cancel
+    if ! selected_file=$(whiptail_menu "$title" "Choose a $file_type file:" menu_options); then
+        echo "$file_type file selection cancelled." >&2
         return 1
     fi
-    echo "$selected_file"
+    printf '%s\n' "$selected_file"
 }
 
 # Function to parse docker-compose.yml and present a select menu of services
@@ -108,10 +120,7 @@ select_service() {
     done <<< "$services"
 
     local selected_service
-    selected_service=$(whiptail_menu "Select a Service" "Choose a service:" menu_options)
-    local exit_status=$?
-
-    if [ "$exit_status" -ne 0 ]; then
+    if ! selected_service=$(whiptail_menu "Select a Service" "Choose a service:" menu_options); then
         echo "Service selection cancelled." >&2
         return 1
     fi
@@ -125,10 +134,11 @@ select_service() {
 select_deployment_method() {
     local methods=()
     local menu_options=()
+    local ssh_uri="${SSH_URI:-}"
 
     # Only add SSH_URI option if it's set in the .env file
-    if [ -n "${SSH_URI:-}" ]; then # Use :- to prevent error if SSH_URI is unset
-        methods+=("$SSH_URI")
+    if [ -n "$ssh_uri" ]; then
+        methods+=("$ssh_uri")
     fi
 
     # Add other options
@@ -139,18 +149,15 @@ select_deployment_method() {
     done
 
     local selected_method
-    selected_method=$(whiptail_menu "Select Deployment Method" "Choose deployment method:" menu_options)
-    local exit_status=$?
-
-    if [ "$exit_status" -ne 0 ]; then
+    if ! selected_method=$(whiptail_menu "Select Deployment Method" "Choose deployment method:" menu_options); then
         echo "Deployment method selection cancelled. Exiting." >&2
         return 1
     fi
 
     case "$selected_method" in
-    "$SSH_URI")
-        export DOCKER_HOST="$SSH_URI"
-        echo "Selected deployment method: Pre-configured SSH URI ($SSH_URI)"
+    "$ssh_uri")
+        export DOCKER_HOST="$ssh_uri"
+        echo "Selected deployment method: Pre-configured SSH URI ($ssh_uri)"
         ;;
     "Locally")
         unset DOCKER_HOST # Ensure DOCKER_HOST is not set for local
@@ -158,9 +165,7 @@ select_deployment_method() {
         ;;
     "Custom SSH Connection")
         local custom_ssh_uri
-        custom_ssh_uri=$(whiptail --inputbox "Enter SSH URI (user@server):" 8 78 "" 3>&1 1>&2 2>&3)
-        exit_status=$?
-        if [ "$exit_status" -ne 0 ]; then
+        if ! custom_ssh_uri=$(whiptail --inputbox "Enter SSH URI (user@server):" 8 78 "" 3>&1 1>&2 2>&3); then
             echo "Custom SSH URI input cancelled. Exiting." >&2
             return 1
         fi
@@ -191,6 +196,27 @@ prepare_temp_compose() {
     var_list=$(grep -v '^\s*#' "$ENV_FILE" | grep '=' | cut -d= -f1 | sed 's/^/\$/' | tr '\n' ' ')
 
     envsubst "$var_list" < "$YML_FILE" > "$TEMP_YML_FILE"
+
+    # Resolve shell-style required/default forms that envsubst intentionally
+    # leaves untouched, such as ${VAR:?message} and ${VAR:-default}.
+    local rendered_temp_file
+    rendered_temp_file=$(mktemp "${yml_dir}/.docker-compose-rendered-XXXXXX.yml")
+    if ! perl -0pe '
+        s/\$\{([A-Za-z_][A-Za-z0-9_]*)\:\?([^}]*)\}/
+            (defined $ENV{$1} && length $ENV{$1})
+                ? $ENV{$1}
+                : die "ERROR: Missing required environment variable $1 ($2)\n"
+        /gex;
+        s/\$\{([A-Za-z_][A-Za-z0-9_]*)\:\-([^}]*)\}/
+            (defined $ENV{$1} && length $ENV{$1})
+                ? $ENV{$1}
+                : $2
+        /gex;
+    ' "$TEMP_YML_FILE" > "$rendered_temp_file"; then
+        rm -f "$rendered_temp_file"
+        return 1
+    fi
+    mv "$rendered_temp_file" "$TEMP_YML_FILE"
 
     # Escape bare $ signs in substituted values so Docker Compose doesn't
     # try to interpolate them (e.g. passwords containing $X characters).
@@ -521,10 +547,7 @@ show_main_menu() {
     fi
 
     local chosen_option
-    chosen_option=$(whiptail_menu "Main Menu" "Choose an action:" options)
-    local exit_status=$?
-
-    if [ "$exit_status" -ne 0 ]; then
+    if ! chosen_option=$(whiptail_menu "Main Menu" "Choose an action:" options); then
         echo "Main menu selection cancelled. Exiting."
         exit 0 # Exit gracefully on cancel from main menu
     fi
@@ -556,9 +579,9 @@ main() {
     echo "Starting Docker Compose Management Script..."
 
     # Select .env file
-    ENV_FILE=$(select_file "ENV" "./.env" "*.env")
-    if [ -z "$ENV_FILE" ]; then
-        echo "No .env file selected. Exiting." >&2
+    local env_default_files=("./.env")
+    local env_search_patterns=("*.env" ".env.*")
+    if ! ENV_FILE=$(select_file "ENV" env_default_files env_search_patterns); then
         exit 1
     fi
     echo "Using ENV file: $ENV_FILE"
@@ -571,13 +594,18 @@ main() {
     fi
     set +a
 
-    # Select .yml file
-    YML_FILE=$(select_file "YML" "./docker-compose.yml" "*.yml")
-    if [ -z "$YML_FILE" ]; then
-        echo "No .yml file selected. Exiting." >&2
+    # Select compose file
+    local compose_default_files=(
+        "./docker-compose.yml"
+        "./docker-compose.yaml"
+        "./compose.yml"
+        "./compose.yaml"
+    )
+    local compose_search_patterns=("*.yml" "*.yaml")
+    if ! YML_FILE=$(select_file "Compose" compose_default_files compose_search_patterns); then
         exit 1
     fi
-    echo "Using YML file: $YML_FILE"
+    echo "Using compose file: $YML_FILE"
 
     # Pre-substitute env vars into a temp compose file so Docker Compose
     # receives concrete values rather than ${VAR} placeholders.
