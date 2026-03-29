@@ -6,6 +6,11 @@ DIST_DIR="$ROOT_DIR/dist"
 
 mkdir -p "$DIST_DIR"
 
+LDFLAGS=()
+if [[ -n "${VERSION:-}" ]]; then
+    LDFLAGS=(-ldflags "-X main.version=${VERSION}")
+fi
+
 build() {
     local goos="$1"
     local goarch="$2"
@@ -15,7 +20,7 @@ build() {
     mkdir -p "$DIST_DIR/$target_dir"
     echo "Building $target_dir/$output_name"
     GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-        go build -trimpath -o "$DIST_DIR/$target_dir/$output_name" .
+        go build -trimpath "${LDFLAGS[@]}" -o "$DIST_DIR/$target_dir/$output_name" .
 }
 
 build linux amd64 linux deploy

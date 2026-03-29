@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -244,6 +246,16 @@ func TestParseCLIArgsHelpAndConflicts(t *testing.T) {
 		}
 	})
 
+	t.Run("version", func(t *testing.T) {
+		options, err := parseCLIArgs([]string{"--version"})
+		if err != nil {
+			t.Fatalf("parseCLIArgs returned error: %v", err)
+		}
+		if !options.showVersion {
+			t.Fatal("expected version flag to be set")
+		}
+	})
+
 	t.Run("conflicting profile values", func(t *testing.T) {
 		if _, err := parseCLIArgs([]string{"--profile", "prod", "dev"}); err == nil {
 			t.Fatal("expected conflicting profile values to return an error")
@@ -324,8 +336,30 @@ func TestPrintUsage(t *testing.T) {
 	if !strings.Contains(text, "deploy [flags]") {
 		t.Fatalf("expected usage text to mention flags, got %q", text)
 	}
-	if !strings.Contains(text, "--profile") || !strings.Contains(text, "--help") || !strings.Contains(text, "--install") {
-		t.Fatalf("expected usage text to mention help, profile, and install flags, got %q", text)
+	if !strings.Contains(text, "--profile") || !strings.Contains(text, "--help") || !strings.Contains(text, "--install") || !strings.Contains(text, "--version") {
+		t.Fatalf("expected usage text to mention help, profile, install, and version flags, got %q", text)
+	}
+}
+
+func TestRunVersion(t *testing.T) {
+	previousVersion := version
+	version = "v1.2.3"
+	defer func() {
+		version = previousVersion
+	}()
+
+	var stdout bytes.Buffer
+	application := &app{
+		reader: bufio.NewReader(strings.NewReader("")),
+		stdout: &stdout,
+		stderr: io.Discard,
+	}
+
+	if err := application.run([]string{"--version"}); err != nil {
+		t.Fatalf("run returned error: %v", err)
+	}
+	if got := stdout.String(); got != "deploy v1.2.3\n" {
+		t.Fatalf("unexpected version output %q", got)
 	}
 }
 

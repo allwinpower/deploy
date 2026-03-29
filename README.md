@@ -27,7 +27,14 @@ To build release binaries for Linux, macOS, and Windows from one machine:
 ./build.sh
 ```
 
+To embed a release version in those binaries:
+
+```bash
+VERSION=v1.2.3 ./build.sh
+```
+
 Artifacts are written to `dist/`.
+`dist/` is generated build output and is gitignored; it should not be treated as a release source directory in the repo.
 
 ## Usage
 
@@ -44,24 +51,27 @@ Artifacts are written to `dist/`.
 Supported flags:
 
 - `-h`, `--help` show help output and exit
-- `-i`, `--install` copy the current `deploy` binary into a user executable path and exit
+- `-i`, `--install` install the current `deploy` binary into a user executable path and exit
 - `-p`, `--profile` set `COMPOSE_PROFILES`
 - `-e`, `--env` preselect the env file
 - `-f`, `--file` preselect the compose file
+- `-v`, `--version` show the binary version and exit
 
 Examples:
 
 ```bash
 ./deploy --help
 ./deploy --install
+./deploy -i
 ./deploy prod
 ./deploy -p prod
 ./deploy -e .env.prod -f compose.yml
+./deploy --version
 ```
 
 ## Install
 
-`deploy --install` copies the currently running binary into a user-scoped executable directory without `sudo`, then exits.
+`deploy --install` and `deploy -i` both install the currently running binary into a user-scoped executable directory without `sudo`, then exit.
 
 The installer uses the first writable user-owned directory already on `PATH`. If none exists, it falls back to:
 
@@ -125,6 +135,22 @@ Docker Compose performs interpolation directly via `--env-file`. The CLI validat
 - `dist/macos-amd64/deploy`
 - `dist/macos-arm64/deploy`
 - `dist/windows/deploy.exe`
+
+## GitHub Releases
+
+The repository includes a GitHub Actions workflow that publishes a Release when you push a tag that matches `v*`, for example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That workflow:
+
+- runs `go test ./...`
+- builds the release binaries with the tag embedded as the CLI version
+- packages release assets for Linux, macOS, and Windows
+- uploads those assets plus `checksums.txt` to the GitHub Release page
 
 ## How It Works
 

@@ -66,6 +66,7 @@ type sshSpec struct {
 }
 
 var errSelectionCancelled = errors.New("selection cancelled")
+var version = "dev"
 
 type cliOptions struct {
 	profile     string
@@ -73,6 +74,7 @@ type cliOptions struct {
 	composeFile string
 	install     bool
 	showHelp    bool
+	showVersion bool
 }
 
 type stringFlag struct {
@@ -116,6 +118,10 @@ func (a *app) run(args []string) error {
 	}
 	if options.showHelp {
 		a.printUsage(a.stdout)
+		return nil
+	}
+	if options.showVersion {
+		fmt.Fprintln(a.stdout, versionString())
 		return nil
 	}
 	if options.install {
@@ -226,6 +232,7 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	var fileFlag stringFlag
 	var install bool
 	var help bool
+	var showVersion bool
 
 	flagSet := flag.NewFlagSet("deploy", flag.ContinueOnError)
 	flagSet.SetOutput(io.Discard)
@@ -239,6 +246,8 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	flagSet.BoolVar(&install, "install", false, "")
 	flagSet.BoolVar(&help, "h", false, "")
 	flagSet.BoolVar(&help, "help", false, "")
+	flagSet.BoolVar(&showVersion, "v", false, "")
+	flagSet.BoolVar(&showVersion, "version", false, "")
 
 	if err := flagSet.Parse(args); err != nil {
 		return options, err
@@ -246,6 +255,9 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 
 	if help {
 		options.showHelp = true
+	}
+	if showVersion {
+		options.showVersion = true
 	}
 
 	if profileFlag.set {
@@ -308,6 +320,7 @@ func (a *app) printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -p, --profile NAME     Set COMPOSE_PROFILES (default: dev)")
 	fmt.Fprintln(w, "  -e, --env PATH         Preselect the env file")
 	fmt.Fprintln(w, "  -f, --file PATH        Preselect the compose file")
+	fmt.Fprintln(w, "  -v, --version          Show version and exit")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Notes:")
 	fmt.Fprintln(w, "  Actions are still selected in the terminal UI.")
@@ -319,6 +332,11 @@ func (a *app) printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  deploy prod")
 	fmt.Fprintln(w, "  deploy --profile prod")
 	fmt.Fprintln(w, "  deploy -e .env.prod -f compose.yml")
+	fmt.Fprintln(w, "  deploy --version")
+}
+
+func versionString() string {
+	return fmt.Sprintf("deploy %s", version)
 }
 
 func (a *app) installSelf() error {
