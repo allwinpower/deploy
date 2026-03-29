@@ -42,6 +42,18 @@ whiptail_menu() {
         "${options_ref[@]}" 3>&1 1>&2 2>&3
 }
 
+whiptail_msgbox() {
+    local title="$1"
+    local message="$2"
+
+    if ! command -v whiptail &> /dev/null; then
+        echo "$title: $message" >&2
+        return 1
+    fi
+
+    whiptail --title "$title" --msgbox "$message" 10 78
+}
+
 # Generic function to find files and present a select menu
 # Args: file_type (e.g., "ENV", "Compose"), default_files_array, search_patterns_array
 # Returns: selected_file_path or empty string on cancel
@@ -531,6 +543,13 @@ main() {
         exit 1
     fi
     set +a
+
+    if [ -z "${PROJECT:-}" ]; then
+        whiptail_msgbox \
+            "Missing PROJECT" \
+            "The selected env file does not set PROJECT. Set PROJECT in $ENV_FILE before using this script."
+        exit 1
+    fi
 
     # Select compose file
     local compose_default_files=(

@@ -50,6 +50,7 @@ The `.env` file is sourced with `set -a` so all variables are automatically expo
 | Variable   | Purpose                                                          |
 |------------|------------------------------------------------------------------|
 | `SSH_URI`  | Remote host in `user@host` format; enables SSH deployment options |
+| `PROJECT`  | Required project identifier; the script shows a warning and exits if it is missing |
 
 Variables defined in the `.env` file are substituted into a temporary copy of the compose file before any Docker Compose command runs. The renderer supports `${VAR}`, `${VAR:?message}`, and `${VAR:-default}` forms, errors out if required values are missing, and reports missing env/compose candidates or cancelled selections cleanly instead of exiting abruptly.
 
