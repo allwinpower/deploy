@@ -1,72 +1,138 @@
 # deploy
 
-An interactive terminal UI script for managing Docker Compose deployments — locally or over SSH.
+A cross-platform Go CLI for managing Docker Compose deployments locally or over SSH, with a built-in terminal UI.
 
 ## Requirements
 
-- `bash` 4.3+ (uses namerefs)
+- Go 1.24+ to build from source
 - `docker` with the Compose plugin
-- `whiptail` — for interactive menus (`sudo apt install whiptail`)
-- `yq` — for parsing compose files (`sudo snap install yq`)
-- `envsubst` — for env var substitution (typically pre-installed via `gettext`)
-- `perl` — for resolving `${VAR:?message}` and `${VAR:-default}` compose expressions
+
+No `bash`, `whiptail`, `yq`, `envsubst`, or `perl` are required at runtime.
+
+## Build
+
+```bash
+go build -o deploy .
+```
+
+On Windows:
+
+```powershell
+go build -o deploy.exe .
+```
+
+To build release binaries for Linux, macOS, and Windows from one machine:
+
+```bash
+./build.sh
+```
+
+Artifacts are written to `dist/`.
 
 ## Usage
 
 ```bash
 ./deploy [profile]
+./deploy [flags]
 ```
 
-| Argument  | Description                                                 |
-|-----------|-------------------------------------------------------------|
-| _(none)_  | Sets `COMPOSE_PROFILES=dev`                                 |
-| `profile` | Sets `COMPOSE_PROFILES` to the given value (e.g. `prod`)    |
+| Argument  | Description                                              |
+|-----------|----------------------------------------------------------|
+| _(none)_  | Sets `COMPOSE_PROFILES=dev`                              |
+| `profile` | Sets `COMPOSE_PROFILES` to the given value, e.g. `prod`  |
 
-On launch the script walks you through the startup flow in this order:
+Supported flags:
 
-1. **Select `.env` file** — scans the current directory (up to 2 levels deep) for `*.env` and `.env.*` files; prefers `./.env`
-2. **Select compose file** — scans for both `*.yml` and `*.yaml` files; prefers `./docker-compose.yml`, `./docker-compose.yaml`, `./compose.yml`, then `./compose.yaml`
-3. **Validate rendered compose metadata** — warns if top-level `version:` exists, and exits if top-level `name:` is missing or does not match env `PROJECT`
-4. **Select deployment method** — local Docker daemon or, when `SSH_URI` is set in the env file, the pre-configured SSH target. If `SSH_URI` is missing, the script warns and forces local-only deployment.
+- `-h`, `--help` show help output and exit
+- `-i`, `--install` copy the current `deploy` binary into a user executable path and exit
+- `-p`, `--profile` set `COMPOSE_PROFILES`
+- `-e`, `--env` preselect the env file
+- `-f`, `--file` preselect the compose file
+
+Examples:
+
+```bash
+./deploy --help
+./deploy --install
+./deploy prod
+./deploy -p prod
+./deploy -e .env.prod -f compose.yml
+```
+
+## Install
+
+`deploy --install` copies the currently running binary into a user-scoped executable directory without `sudo`, then exits.
+
+The installer uses the first writable user-owned directory already on `PATH`. If none exists, it falls back to:
+
+- Linux: `${XDG_BIN_HOME:-$HOME/.local/bin}`
+- macOS: `$HOME/.local/bin`
+- Windows: `%USERPROFILE%\bin`
+
+If the fallback directory is not already on `PATH`, `deploy` prints the exact command to add it for the current shell session.
+
+On launch the CLI opens an interactive terminal UI and walks through the same flow as the old script:
+
+1. Select `.env` file
+2. Select compose file
+3. Validate compose metadata
+4. Select deployment method
+5. Run one action from the main menu
 
 ## Main Menu Actions
 
-| Action                    | Description                                                         |
-|---------------------------|---------------------------------------------------------------------|
-| Deploy All Services       | Builds all images and starts all containers (`up -d --force-recreate --remove-orphans`) |
-| Redeploy Service          | Rebuilds and restarts a single selected service                     |
-| Restart Service           | Restarts a single selected service (no rebuild)                     |
-| Undeploy Service          | Stops and removes a single service container and its volumes        |
-| Service Shell             | Opens an interactive `sh` shell inside a selected container         |
-| Service Logs              | Prints logs for a selected service                                  |
-| Live Service Log Viewer   | Tails live logs for a selected service (`Ctrl+C` to stop)           |
-| Undeploy All Services     | Runs `docker compose down -v` to remove all containers and Compose-managed volumes |
-| Undeploy All Services (Keep Volumes) | Runs `docker compose down` to remove containers and networks but keep volumes |
-| Create External Networks  | Creates any external Docker networks declared in the compose file   |
-| Host Shell                | Opens an SSH session to the remote host when SSH deployment is available |
-| Host Shell (Unavailable)  | Shown in local-only mode to indicate SSH host access cannot be used |
+| Action | Description |
+|--------|-------------|
+| Deploy All Services | Builds all images and starts all containers with `up -d --force-recreate --remove-orphans` |
+| Redeploy Service | Rebuilds and restarts one selected service |
+| Restart Service | Restarts one selected service without rebuilding |
+| Undeploy Service | Stops and removes one selected service and its volumes |
+| Service Shell | Opens an interactive `sh` shell inside one selected service |
+| Service Logs | Prints logs for one selected service |
+| Live Service Log Viewer | Follows logs for one selected service until interrupted |
+| Undeploy All Services | Runs `docker compose down -v` |
+| Undeploy All Services (Keep Volumes) | Runs `docker compose down` |
+| Create External Networks | Creates any external Docker networks declared in the compose file |
+| Host Shell | Opens an SSH shell to the selected remote host using the local `ssh` client |
+| Host Shell (Unavailable) | Shown when SSH deployment is not available |
 
 ## Environment File
 
-The `.env` file is sourced with `set -a` so all variables are automatically exported. Key variables:
+The selected env file must be a standard dotenv file. Supported syntax:
 
-| Variable   | Purpose                                                          |
-|------------|------------------------------------------------------------------|
-| `SSH_URI`  | Remote host in `user@host` format; if missing, the script warns and allows local deployment only |
-| `PROJECT`  | Required project identifier; the script shows a warning and exits if it is missing |
+- `KEY=VALUE`
+- blank lines
+- comments
+- single-quoted values
+- double-quoted values
 
-Variables defined in the `.env` file are substituted into a temporary copy of the compose file before any Docker Compose command runs. The renderer supports `${VAR}`, `${VAR:?message}`, and `${VAR:-default}` forms, errors out if required values are missing, and reports missing env/compose candidates or cancelled selections cleanly instead of exiting abruptly.
+Shell syntax such as `export`, command substitution, or chained commands is rejected.
 
-The rendered Compose file is then validated before any deployment actions are available:
-- Top-level `version:` triggers a warning because it is obsolete in the current Compose standard.
-- Top-level `name:` is required.
-- Top-level `name:` must exactly match env `PROJECT`.
+Key variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `PROJECT` | Required project identifier. Compose `name` must match it exactly. |
+| `SSH_URI` | Optional remote target in `user@host`, `user@host:port`, `ssh://user@host`, or `ssh://user@host:port` form. |
+
+Docker Compose performs interpolation directly via `--env-file`. The CLI validates the resolved model with `docker compose config` before any action is available.
+
+## Release Artifacts
+
+`build.sh` produces:
+
+- `dist/linux/deploy`
+- `dist/macos-amd64/deploy`
+- `dist/macos-arm64/deploy`
+- `dist/windows/deploy.exe`
 
 ## How It Works
 
-1. The selected `.env` file is sourced into the shell environment.
-2. The selected compose file is processed by `envsubst`, producing a temp file (`.docker-compose-XXXXXX.yml`) alongside the original so relative build context paths resolve correctly.
-3. The rendered temp compose file is validated: obsolete top-level `version:` warns, and top-level `name:` must exist and exactly match env `PROJECT`.
-4. If `SSH_URI` is set, the user can choose between local and the pre-configured SSH target. If `SSH_URI` is missing, the script warns and forces local-only mode.
-5. All `docker compose` commands run against the temp file. It is automatically deleted on exit.
-6. When an SSH deployment target is selected, `DOCKER_HOST` is set to the SSH URI so Docker commands are forwarded to the remote daemon transparently.
+1. The CLI reads the selected env file and checks that `PROJECT` is present.
+2. The compose file is validated with `docker compose --env-file <env> -f <compose> config --quiet`.
+3. The resolved compose model is loaded with `docker compose config --format json`.
+4. A warning is shown if the raw compose file still contains a top-level `version` key.
+5. The resolved compose `name` must exist and exactly match env `PROJECT`.
+6. If `SSH_URI` is set, the user can choose between local deployment and the configured remote Docker host.
+7. All Compose actions run directly against the selected compose file and env file; no temporary compose file is generated.
+8. The Host Shell action uses the local `ssh` client, so it follows your existing SSH config, agent state, and identity selection.
