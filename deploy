@@ -239,6 +239,41 @@ prepare_temp_compose() {
     echo "Temp compose file written: $TEMP_YML_FILE"
 }
 
+validate_compose_metadata() {
+    if ! command -v yq &> /dev/null; then
+        echo "Error: yq is not installed. Please install it (e.g., sudo snap install yq)." >&2
+        return 1
+    fi
+
+    local compose_version
+    local compose_name
+
+    compose_version=$(yq e '.version // ""' "$TEMP_YML_FILE" 2>/dev/null || true)
+    compose_name=$(yq e '.name // ""' "$TEMP_YML_FILE" 2>/dev/null || true)
+
+    if [ -n "$compose_version" ]; then
+        whiptail_msgbox \
+            "Obsolete Compose Version" \
+            "The selected compose file sets top-level version: $compose_version. This is not part of the current Compose standard. Remove it."
+    fi
+
+    if [ -z "$compose_name" ]; then
+        whiptail_msgbox \
+            "Missing Compose Name" \
+            "The selected compose file must set a top-level name: that matches PROJECT ($PROJECT)."
+        return 1
+    fi
+
+    if [ "$compose_name" != "$PROJECT" ]; then
+        whiptail_msgbox \
+            "Compose Name Mismatch" \
+            "Compose name '$compose_name' does not match PROJECT '$PROJECT'. Update the compose file or env file before using this script."
+        return 1
+    fi
+
+    return 0
+}
+
 # Function to construct the Docker Compose command
 # Returns the full docker compose command string
 compose_cmd() {
@@ -569,6 +604,11 @@ main() {
     # receives concrete values rather than ${VAR} placeholders.
     if ! prepare_temp_compose; then
         echo "Failed to prepare temporary compose file." >&2
+        exit 1
+    fi
+
+    if ! validate_compose_metadata; then
+        echo "Compose file validation failed." >&2
         exit 1
     fi
 

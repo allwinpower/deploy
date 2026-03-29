@@ -9,6 +9,7 @@ An interactive terminal UI script for managing Docker Compose deployments — lo
 - `whiptail` — for interactive menus (`sudo apt install whiptail`)
 - `yq` — for parsing compose files (`sudo snap install yq`)
 - `envsubst` — for env var substitution (typically pre-installed via `gettext`)
+- `perl` — for resolving `${VAR:?message}` and `${VAR:-default}` compose expressions
 
 ## Usage
 
@@ -21,11 +22,12 @@ An interactive terminal UI script for managing Docker Compose deployments — lo
 | _(none)_  | Sets `COMPOSE_PROFILES=dev`                                 |
 | `profile` | Sets `COMPOSE_PROFILES` to the given value (e.g. `prod`)    |
 
-On launch the script walks you through three interactive prompts:
+On launch the script walks you through the startup flow in this order:
 
 1. **Select `.env` file** — scans the current directory (up to 2 levels deep) for `*.env` and `.env.*` files; prefers `./.env`
 2. **Select compose file** — scans for both `*.yml` and `*.yaml` files; prefers `./docker-compose.yml`, `./docker-compose.yaml`, `./compose.yml`, then `./compose.yaml`
-3. **Select deployment method** — local Docker daemon or, when `SSH_URI` is set in the env file, the pre-configured SSH target. If `SSH_URI` is missing, the script warns and forces local-only deployment.
+3. **Validate rendered compose metadata** — warns if top-level `version:` exists, and exits if top-level `name:` is missing or does not match env `PROJECT`
+4. **Select deployment method** — local Docker daemon or, when `SSH_URI` is set in the env file, the pre-configured SSH target. If `SSH_URI` is missing, the script warns and forces local-only deployment.
 
 ## Main Menu Actions
 
@@ -55,9 +57,16 @@ The `.env` file is sourced with `set -a` so all variables are automatically expo
 
 Variables defined in the `.env` file are substituted into a temporary copy of the compose file before any Docker Compose command runs. The renderer supports `${VAR}`, `${VAR:?message}`, and `${VAR:-default}` forms, errors out if required values are missing, and reports missing env/compose candidates or cancelled selections cleanly instead of exiting abruptly.
 
+The rendered Compose file is then validated before any deployment actions are available:
+- Top-level `version:` triggers a warning because it is obsolete in the current Compose standard.
+- Top-level `name:` is required.
+- Top-level `name:` must exactly match env `PROJECT`.
+
 ## How It Works
 
 1. The selected `.env` file is sourced into the shell environment.
 2. The selected compose file is processed by `envsubst`, producing a temp file (`.docker-compose-XXXXXX.yml`) alongside the original so relative build context paths resolve correctly.
-3. All `docker compose` commands run against the temp file. It is automatically deleted on exit.
-4. When an SSH deployment target is selected, `DOCKER_HOST` is set to the SSH URI so Docker commands are forwarded to the remote daemon transparently.
+3. The rendered temp compose file is validated: obsolete top-level `version:` warns, and top-level `name:` must exist and exactly match env `PROJECT`.
+4. If `SSH_URI` is set, the user can choose between local and the pre-configured SSH target. If `SSH_URI` is missing, the script warns and forces local-only mode.
+5. All `docker compose` commands run against the temp file. It is automatically deleted on exit.
+6. When an SSH deployment target is selected, `DOCKER_HOST` is set to the SSH URI so Docker commands are forwarded to the remote daemon transparently.
