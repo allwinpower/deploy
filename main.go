@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -197,14 +198,13 @@ func (a *app) run(args []string) error {
 		a.msgBox("Obsolete Compose Version", "The selected compose file sets a top-level version. This is not part of the current Compose standard. Remove it.")
 	}
 
-	if err := validateCompose(composeEnv, sanitizedEnvFile, composeFile); err != nil {
-		a.msgBox("Compose Validation Warning", err.Error()+"\n\nYou may need to create external networks first.")
-	}
-
 	model, err := loadComposeModel(composeEnv, sanitizedEnvFile, composeFile)
 	if err != nil {
-		a.msgBox("Compose Load Warning", "Could not load compose model: "+err.Error()+"\nService-specific actions will be unavailable.")
-		model = composeModel{Name: project}
+		model, err = loadComposeModelFromYAML(composeFile, envValues)
+		if err != nil {
+			a.msgBox("Compose Load Warning", "Could not load compose model: "+err.Error()+"\nService-specific actions will be unavailable.")
+			model = composeModel{Name: project}
+		}
 	}
 
 	if strings.TrimSpace(model.Name) == "" {
@@ -491,13 +491,10 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 
 	switch action {
 	case "Deploy All Services":
-		if err := validateCompose(composeEnv, ctx.envFile, ctx.composeFile); err != nil {
-			return err
-		}
-		fmt.Fprintln(a.stdout, "Deploying all services...")
 		if err := a.createExternalNetworks(ctx, composeEnv); err != nil {
 			return err
 		}
+		fmt.Fprintln(a.stdout, "Deploying all services...")
 		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, composeBuildArgs("")...); err != nil {
 			return err
 		}
@@ -508,6 +505,9 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 			return err
 		}
 		fmt.Fprintf(a.stdout, "Redeploying service: %s...\n", service)
+		if err := a.createExternalNetworks(ctx, composeEnv); err != nil {
+			return err
+		}
 		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, composeBuildArgs(service)...); err != nil {
 			return err
 		}
@@ -1511,6 +1511,72 @@ func loadComposeModel(env []string, envFile, composeFile string) (composeModel, 
 	var model composeModel
 	if err := json.Unmarshal(output, &model); err != nil {
 		return composeModel{}, fmt.Errorf("failed to parse docker compose config output: %w", err)
+	}
+
+	return model, nil
+}
+
+var envVarPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+
+func substituteEnvVars(text string, env map[string]string) string {
+	return envVarPattern.ReplaceAllStringFunc(text, func(match string) string {
+		groups := envVarPattern.FindStringSubmatch(match)
+		var key, defaultVal string
+		if groups[1] != "" {
+			key = groups[1]
+			defaultVal = groups[2]
+		} else {
+			key = groups[3]
+		}
+		if val, ok := env[key]; ok {
+			return val
+		}
+		return defaultVal
+	})
+}
+
+func loadComposeModelFromYAML(composeFile string, envValues map[string]string) (composeModel, error) {
+	data, err := os.ReadFile(composeFile)
+	if err != nil {
+		return composeModel{}, err
+	}
+
+	content := substituteEnvVars(string(data), envValues)
+
+	var raw struct {
+		Name     string                 `yaml:"name"`
+		Services map[string]interface{} `yaml:"services"`
+		Networks map[string]struct {
+			Name     string      `yaml:"name"`
+			External interface{} `yaml:"external"`
+		} `yaml:"networks"`
+	}
+
+	if err := yaml.Unmarshal([]byte(content), &raw); err != nil {
+		return composeModel{}, err
+	}
+
+	model := composeModel{
+		Name:     raw.Name,
+		Services: make(map[string]json.RawMessage, len(raw.Services)),
+		Networks: make(map[string]composeNetwork, len(raw.Networks)),
+	}
+	for k := range raw.Services {
+		model.Services[k] = json.RawMessage("{}")
+	}
+	for k, n := range raw.Networks {
+		ext := false
+		switch v := n.External.(type) {
+		case bool:
+			ext = v
+		case map[string]interface{}:
+			ext = true // deprecated external.name format
+		}
+		name := strings.TrimSpace(n.Name)
+		if name == "" {
+			name = k
+		}
+		model.Networks[k] = composeNetwork{Name: name, External: ext}
 	}
 
 	return model, nil
