@@ -159,6 +159,12 @@ func (a *app) run(args []string) error {
 		return fmt.Errorf("failed to parse env file %s: %w", envFile, err)
 	}
 
+	sanitizedEnvFile, cleanupEnv, err := writeSanitizedEnvFile(envValues)
+	if err != nil {
+		return fmt.Errorf("failed to prepare env for docker compose: %w", err)
+	}
+	defer cleanupEnv()
+
 	project := strings.TrimSpace(envValues["PROJECT"])
 	if project == "" {
 		a.msgBox("Missing PROJECT", fmt.Sprintf("The selected env file does not set PROJECT. Set PROJECT in %s before using this script.", envFile))
@@ -191,13 +197,14 @@ func (a *app) run(args []string) error {
 		a.msgBox("Obsolete Compose Version", "The selected compose file sets a top-level version. This is not part of the current Compose standard. Remove it.")
 	}
 
-	if err := validateCompose(composeEnv, envFile, composeFile); err != nil {
-		return err
+	if err := validateCompose(composeEnv, sanitizedEnvFile, composeFile); err != nil {
+		a.msgBox("Compose Validation Warning", err.Error()+"\n\nYou may need to create external networks first.")
 	}
 
-	model, err := loadComposeModel(composeEnv, envFile, composeFile)
+	model, err := loadComposeModel(composeEnv, sanitizedEnvFile, composeFile)
 	if err != nil {
-		return err
+		a.msgBox("Compose Load Warning", "Could not load compose model: "+err.Error()+"\nService-specific actions will be unavailable.")
+		model = composeModel{Name: project}
 	}
 
 	if strings.TrimSpace(model.Name) == "" {
@@ -210,7 +217,7 @@ func (a *app) run(args []string) error {
 	}
 
 	ctx := composeContext{
-		envFile:     envFile,
+		envFile:     sanitizedEnvFile,
 		composeFile: composeFile,
 		envValues:   envValues,
 		project:     project,
@@ -484,6 +491,9 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 
 	switch action {
 	case "Deploy All Services":
+		if err := validateCompose(composeEnv, ctx.envFile, ctx.composeFile); err != nil {
+			return err
+		}
 		fmt.Fprintln(a.stdout, "Deploying all services...")
 		if err := a.createExternalNetworks(ctx, composeEnv); err != nil {
 			return err
@@ -1307,6 +1317,38 @@ func installExecutable(sourcePath, targetPath, goos string) (bool, error) {
 
 	cleanupTemp = false
 	return true, nil
+}
+
+func writeSanitizedEnvFile(values map[string]string) (path string, cleanup func(), err error) {
+	f, err := os.CreateTemp("", ".deploy-env-*.env")
+	if err != nil {
+		return "", func() {}, err
+	}
+	path = f.Name()
+	cleanup = func() { os.Remove(path) }
+
+	w := bufio.NewWriter(f)
+	for k, v := range values {
+		var formatted string
+		if !strings.Contains(v, "'") {
+			// Single-quote: Docker Compose treats value as literal — no interpolation.
+			formatted = "'" + v + "'"
+		} else {
+			// Unquoted with $$ escaping: Docker Compose resolves $$ → $.
+			formatted = strings.ReplaceAll(v, "$", "$$")
+		}
+		fmt.Fprintf(w, "%s=%s\n", k, formatted)
+	}
+	if err := w.Flush(); err != nil {
+		f.Close()
+		cleanup()
+		return "", func() {}, err
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	return path, cleanup, nil
 }
 
 func parseDotEnvFile(path string) (map[string]string, error) {
