@@ -449,7 +449,7 @@ func (a *app) selectDeploymentTarget(rawSSHURI string) (deploymentTarget, error)
 		}, nil
 	case "Locally":
 		fmt.Fprintln(a.stdout, "Selected deployment method: Locally")
-		return deploymentTarget{label: "Locally"}, nil
+		return deploymentTarget{label: "Locally", sshTarget: sshTarget}, nil
 	default:
 		return deploymentTarget{}, fmt.Errorf("unknown deployment target %q", selected)
 	}
@@ -1410,7 +1410,7 @@ func buildComposeEnv(fileVars map[string]string, profile, dockerHost string) []s
 		blocked[key] = struct{}{}
 	}
 
-	env := make([]string, 0, len(os.Environ())+3)
+	env := make([]string, 0, len(os.Environ())+len(fileVars)+3)
 	for _, item := range os.Environ() {
 		key, _, found := strings.Cut(item, "=")
 		if !found {
@@ -1420,6 +1420,10 @@ func buildComposeEnv(fileVars map[string]string, profile, dockerHost string) []s
 			continue
 		}
 		env = append(env, item)
+	}
+
+	for key, value := range fileVars {
+		env = append(env, key+"="+value)
 	}
 
 	env = append(env, "COMPOSE_BAKE=true")
