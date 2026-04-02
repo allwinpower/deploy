@@ -75,6 +75,7 @@ type cliOptions struct {
 	composeFile string
 	install     bool
 	update      bool
+	forceLocal  bool
 	showHelp    bool
 	showVersion bool
 }
@@ -225,9 +226,25 @@ func (a *app) run(args []string) error {
 		model:       model,
 	}
 
-	target, err := a.selectDeploymentTarget(ctx.sshURI)
-	if err != nil {
-		return err
+	var target deploymentTarget
+	if options.forceLocal {
+		if ctx.sshURI != "" {
+			_, sshTarget, err := normalizeSSHURI(ctx.sshURI)
+			if err != nil {
+				return fmt.Errorf("invalid SSH_URI %q: %w", ctx.sshURI, err)
+			}
+			target = deploymentTarget{label: "Locally", sshTarget: sshTarget}
+			fmt.Fprintln(a.stdout, "Selected deployment method: Locally (--local overrides SSH_URI)")
+		} else {
+			target = deploymentTarget{label: "Locally"}
+			fmt.Fprintln(a.stdout, "Selected deployment method: Locally")
+		}
+	} else {
+		var err error
+		target, err = a.selectDeploymentTarget(ctx.sshURI)
+		if err != nil {
+			return err
+		}
 	}
 	ctx.target = target
 
@@ -252,6 +269,7 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	var fileFlag stringFlag
 	var install bool
 	var update bool
+	var forceLocal bool
 	var help bool
 	var showVersion bool
 
@@ -267,6 +285,8 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	flagSet.BoolVar(&install, "install", false, "")
 	flagSet.BoolVar(&update, "u", false, "")
 	flagSet.BoolVar(&update, "update", false, "")
+	flagSet.BoolVar(&forceLocal, "l", false, "")
+	flagSet.BoolVar(&forceLocal, "local", false, "")
 	flagSet.BoolVar(&help, "h", false, "")
 	flagSet.BoolVar(&help, "help", false, "")
 	flagSet.BoolVar(&showVersion, "v", false, "")
@@ -298,9 +318,15 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	if update {
 		options.update = true
 	}
+	if forceLocal {
+		options.forceLocal = true
+	}
 
 	remaining := flagSet.Args()
 	if options.install {
+		if forceLocal {
+			return options, errors.New("--install cannot be combined with --local")
+		}
 		if profileFlag.set {
 			return options, errors.New("--install cannot be combined with --profile")
 		}
@@ -316,6 +342,9 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 		return options, nil
 	}
 	if options.update {
+		if forceLocal {
+			return options, errors.New("--update cannot be combined with --local")
+		}
 		if profileFlag.set {
 			return options, errors.New("--update cannot be combined with --profile")
 		}
@@ -368,6 +397,7 @@ func (a *app) printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -u, --update           Update deploy to the latest stable release and exit")
 	fmt.Fprintln(w, "  -e, --env PATH         Preselect the env file")
 	fmt.Fprintln(w, "  -f, --file PATH        Preselect the compose file")
+	fmt.Fprintln(w, "  -l, --local            Use local Docker even if SSH_URI is set in the env file")
 	fmt.Fprintln(w, "  -v, --version          Show version and exit")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Notes:")
@@ -381,6 +411,7 @@ func (a *app) printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  deploy prod")
 	fmt.Fprintln(w, "  deploy --profile prod")
 	fmt.Fprintln(w, "  deploy -e .env.prod -f compose.yml")
+	fmt.Fprintln(w, "  deploy -p dev -f docker-compose.yaml -e liftorai.env --local")
 	fmt.Fprintln(w, "  deploy --version")
 }
 

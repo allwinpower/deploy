@@ -229,6 +229,9 @@ func TestParseCLIArgsDefaults(t *testing.T) {
 	if options.showHelp {
 		t.Fatal("did not expect help flag to be set")
 	}
+	if options.forceLocal {
+		t.Fatal("did not expect forceLocal to be set by default")
+	}
 }
 
 func TestParseCLIArgsSupportsFlagsAndPositionalProfile(t *testing.T) {
@@ -249,6 +252,26 @@ func TestParseCLIArgsSupportsFlagsAndPositionalProfile(t *testing.T) {
 		}
 		if options.profile != "prod" {
 			t.Fatalf("expected positional profile prod, got %q", options.profile)
+		}
+	})
+
+	t.Run("local long flag", func(t *testing.T) {
+		options, err := parseCLIArgs([]string{"--local", "-p", "dev"})
+		if err != nil {
+			t.Fatalf("parseCLIArgs returned error: %v", err)
+		}
+		if !options.forceLocal || options.profile != "dev" {
+			t.Fatalf("unexpected options: %#v", options)
+		}
+	})
+
+	t.Run("local short flag", func(t *testing.T) {
+		options, err := parseCLIArgs([]string{"-l", "-e", ".env", "-f", "compose.yml"})
+		if err != nil {
+			t.Fatalf("parseCLIArgs returned error: %v", err)
+		}
+		if !options.forceLocal || options.envFile != ".env" || options.composeFile != "compose.yml" {
+			t.Fatalf("unexpected options: %#v", options)
 		}
 	})
 }
@@ -331,6 +354,18 @@ func TestParseCLIArgsHelpAndConflicts(t *testing.T) {
 	t.Run("install conflicts with positional profile", func(t *testing.T) {
 		if _, err := parseCLIArgs([]string{"--install", "prod"}); err == nil {
 			t.Fatal("expected install/positional profile conflict to return an error")
+		}
+	})
+
+	t.Run("install conflicts with local flag", func(t *testing.T) {
+		if _, err := parseCLIArgs([]string{"--install", "--local"}); err == nil {
+			t.Fatal("expected install/local conflict to return an error")
+		}
+	})
+
+	t.Run("update conflicts with local flag", func(t *testing.T) {
+		if _, err := parseCLIArgs([]string{"--update", "--local"}); err == nil {
+			t.Fatal("expected update/local conflict to return an error")
 		}
 	})
 

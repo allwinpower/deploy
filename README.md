@@ -56,6 +56,7 @@ Supported flags:
 - `-u`, `--update` update `deploy` to the latest stable release and exit
 - `-e`, `--env` preselect the env file
 - `-f`, `--file` preselect the compose file
+- `-l`, `--local` use local Docker even if `SSH_URI` is set in the env file (skips the deployment-method prompt)
 - `-v`, `--version` show the binary version and exit
 
 Examples:
@@ -68,6 +69,7 @@ Examples:
 ./deploy prod
 ./deploy -p prod
 ./deploy -e .env.prod -f compose.yml
+./deploy -p dev -f docker-compose.yaml -e liftorai.env --local
 ./deploy --version
 ```
 
