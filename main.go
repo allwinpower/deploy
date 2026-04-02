@@ -525,116 +525,30 @@ func (a *app) selectMainAction(ctx composeContext) (string, error) {
 }
 
 func (a *app) syncSecretsToRemote(ctx *composeContext) (func(), error) {
-	if ctx.target.sshTarget == "" {
+	if ctx.target.sshTarget == "" || ctx.target.label == "Locally" {
 		return func() {}, nil
 	}
 
-	var hasFileSecrets bool
-	for _, secret := range ctx.model.Secrets {
-		if secret.File != "" {
-			hasFileSecrets = true
-			break
-		}
-	}
-
-	if !hasFileSecrets {
-		return func() {}, nil
-	}
-
-	fmt.Fprintln(a.stdout, "Syncing secret files to remote server...")
-
-	spec, err := parseSSHSpec(ctx.target.sshTarget)
-	if err != nil {
-		return func() {}, fmt.Errorf("failed to parse ssh target for secrets: %w", err)
-	}
-	baseArgs := buildSystemSSHArgs(spec)
-
-	// Get remote HOME
-	cmdArgs := append([]string(nil), baseArgs...)
-	cmdArgs = append(cmdArgs, "echo $HOME")
-	out, err := exec.Command("ssh", cmdArgs...).Output()
-	if err != nil {
-		return func() {}, fmt.Errorf("failed to get remote HOME: %w", err)
-	}
-	remoteHome := strings.TrimSpace(string(out))
-	if remoteHome == "" {
-		return func() {}, errors.New("remote HOME is empty")
-	}
-
-	remoteDir := filepath.ToSlash(filepath.Join(remoteHome, ".deploy_secrets", ctx.project))
-
-	// Create remote dir
-	cmdArgs = append([]string(nil), baseArgs...)
-	cmdArgs = append(cmdArgs, fmt.Sprintf("mkdir -p %q", remoteDir))
-	if err := exec.Command("ssh", cmdArgs...).Run(); err != nil {
-		return func() {}, fmt.Errorf("failed to create remote secrets dir: %w", err)
-	}
-
-	// Generate override model
-	overrideModel := struct {
-		Secrets map[string]struct {
-			File string `yaml:"file"`
-		} `yaml:"secrets"`
-	}{
-		Secrets: make(map[string]struct {
-			File string `yaml:"file"`
-		}),
-	}
-
+	// Docker Compose resolves top-level secrets `file:` paths on the machine
+	// that runs the CLI, even when DOCKER_HOST=ssh://... targets a remote
+	// daemon. The previous behavior copied files to ~/.deploy_secrets on the
+	// SSH host and rewrote compose paths there, which made the local client
+	// stat paths that only existed remotely and broke `docker compose build`.
 	composeDir := filepath.Dir(ctx.composeFile)
 	for name, secret := range ctx.model.Secrets {
 		if secret.File == "" {
 			continue
 		}
-
 		localPath := secret.File
 		if !filepath.IsAbs(localPath) {
 			localPath = filepath.Join(composeDir, localPath)
 		}
-
-		remotePath := filepath.ToSlash(filepath.Join(remoteDir, filepath.Base(localPath)))
-
-		fmt.Fprintf(a.stdout, "  Copying %s -> %s\n", localPath, remotePath)
-
-		fileData, err := os.ReadFile(localPath)
-		if err != nil {
-			return func() {}, fmt.Errorf("failed to read local secret file %q: %w", localPath, err)
+		if _, err := os.Stat(localPath); err != nil {
+			return nil, fmt.Errorf("compose secret %q: need file on this machine for remote Docker deploy: %w (%s)", name, err, localPath)
 		}
-
-		cmdArgs = append([]string(nil), baseArgs...)
-		cmdArgs = append(cmdArgs, fmt.Sprintf("cat > %q && chmod 600 %q", remotePath, remotePath))
-		cmd := exec.Command("ssh", cmdArgs...)
-		cmd.Stdin = bytes.NewReader(fileData)
-		if err := cmd.Run(); err != nil {
-			return func() {}, fmt.Errorf("failed to write remote secret file %q: %w", remotePath, err)
-		}
-
-		overrideModel.Secrets[name] = struct {
-			File string `yaml:"file"`
-		}{File: remotePath}
 	}
 
-	overrideData, err := yaml.Marshal(overrideModel)
-	if err != nil {
-		return func() {}, fmt.Errorf("failed to marshal secrets override: %w", err)
-	}
-
-	overrideFile, err := os.CreateTemp("", ".secrets-override-*.yml")
-	if err != nil {
-		return func() {}, fmt.Errorf("failed to create temp override file: %w", err)
-	}
-	defer overrideFile.Close()
-
-	if _, err := overrideFile.Write(overrideData); err != nil {
-		os.Remove(overrideFile.Name())
-		return func() {}, fmt.Errorf("failed to write override file: %w", err)
-	}
-
-	ctx.composeFiles = append(ctx.composeFiles, overrideFile.Name())
-
-	return func() {
-		os.Remove(overrideFile.Name())
-	}, nil
+	return func() {}, nil
 }
 
 func (a *app) executeAction(ctx composeContext, profile, action string) error {
