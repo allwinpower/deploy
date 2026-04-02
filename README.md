@@ -169,5 +169,6 @@ That workflow:
 5. The resolved compose `name` must exist and exactly match env `PROJECT`.
 6. If `SSH_URI` is set, the user can choose between local deployment and the configured remote Docker host.
 7. Deploy and redeploy actions rebuild with `--no-cache` by default so remote hosts do not reuse stale image layers for production assets.
-8. All Compose actions run directly against the selected compose file and env file; no temporary compose file is generated.
-9. The Host Shell action uses the local `ssh` client, so it follows your existing SSH config, agent state, and identity selection.
+8. When deploying to a remote host over SSH, any local file-based `secrets` are automatically synced to `~/.deploy_secrets/<project>/` on the target host and a dynamic `.secrets-override-*.yml` is generated temporarily for Docker Compose to inject the modified paths.
+9. All Compose actions run directly against the selected compose file and env file (plus the dynamic override if deploying remotely); no permanent modified compose file is written.
+10. The Host Shell action uses the local `ssh` client, so it follows your existing SSH config, agent state, and identity selection.

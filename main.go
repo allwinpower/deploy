@@ -14,8 +14,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,13 +34,14 @@ type app struct {
 }
 
 type composeContext struct {
-	envFile     string
-	composeFile string
-	envValues   map[string]string
-	project     string
-	sshURI      string
-	model       composeModel
-	target      deploymentTarget
+	envFile      string
+	composeFile  string
+	composeFiles []string
+	envValues    map[string]string
+	project      string
+	sshURI       string
+	model        composeModel
+	target       deploymentTarget
 }
 
 type deploymentTarget struct {
@@ -49,10 +50,15 @@ type deploymentTarget struct {
 	sshTarget  string
 }
 
+type composeSecret struct {
+	File string `json:"file"`
+}
+
 type composeModel struct {
 	Name     string                     `json:"name"`
 	Services map[string]json.RawMessage `json:"services"`
 	Networks map[string]composeNetwork  `json:"networks"`
+	Secrets  map[string]composeSecret   `json:"secrets"`
 }
 
 type composeNetwork struct {
@@ -199,7 +205,7 @@ func (a *app) run(args []string) error {
 		a.msgBox("Obsolete Compose Version", "The selected compose file sets a top-level version. This is not part of the current Compose standard. Remove it.")
 	}
 
-	model, err := loadComposeModel(composeEnv, sanitizedEnvFile, composeFile)
+	model, err := loadComposeModel(composeEnv, sanitizedEnvFile, []string{composeFile})
 	if err != nil {
 		model, err = loadComposeModelFromYAML(composeFile, envValues)
 		if err != nil {
@@ -218,12 +224,13 @@ func (a *app) run(args []string) error {
 	}
 
 	ctx := composeContext{
-		envFile:     sanitizedEnvFile,
-		composeFile: composeFile,
-		envValues:   envValues,
-		project:     project,
-		sshURI:      strings.TrimSpace(envValues["SSH_URI"]),
-		model:       model,
+		envFile:      sanitizedEnvFile,
+		composeFile:  composeFile,
+		composeFiles: []string{composeFile},
+		envValues:    envValues,
+		project:      project,
+		sshURI:       strings.TrimSpace(envValues["SSH_URI"]),
+		model:        model,
 	}
 
 	var target deploymentTarget
@@ -517,7 +524,128 @@ func (a *app) selectMainAction(ctx composeContext) (string, error) {
 	return a.promptSelect("Main Menu", "Choose an action:", options)
 }
 
+func (a *app) syncSecretsToRemote(ctx *composeContext) (func(), error) {
+	if ctx.target.sshTarget == "" {
+		return func() {}, nil
+	}
+
+	var hasFileSecrets bool
+	for _, secret := range ctx.model.Secrets {
+		if secret.File != "" {
+			hasFileSecrets = true
+			break
+		}
+	}
+
+	if !hasFileSecrets {
+		return func() {}, nil
+	}
+
+	fmt.Fprintln(a.stdout, "Syncing secret files to remote server...")
+
+	spec, err := parseSSHSpec(ctx.target.sshTarget)
+	if err != nil {
+		return func() {}, fmt.Errorf("failed to parse ssh target for secrets: %w", err)
+	}
+	baseArgs := buildSystemSSHArgs(spec)
+
+	// Get remote HOME
+	cmdArgs := append([]string(nil), baseArgs...)
+	cmdArgs = append(cmdArgs, "echo $HOME")
+	out, err := exec.Command("ssh", cmdArgs...).Output()
+	if err != nil {
+		return func() {}, fmt.Errorf("failed to get remote HOME: %w", err)
+	}
+	remoteHome := strings.TrimSpace(string(out))
+	if remoteHome == "" {
+		return func() {}, errors.New("remote HOME is empty")
+	}
+
+	remoteDir := filepath.ToSlash(filepath.Join(remoteHome, ".deploy_secrets", ctx.project))
+
+	// Create remote dir
+	cmdArgs = append([]string(nil), baseArgs...)
+	cmdArgs = append(cmdArgs, fmt.Sprintf("mkdir -p %q", remoteDir))
+	if err := exec.Command("ssh", cmdArgs...).Run(); err != nil {
+		return func() {}, fmt.Errorf("failed to create remote secrets dir: %w", err)
+	}
+
+	// Generate override model
+	overrideModel := struct {
+		Secrets map[string]struct {
+			File string `yaml:"file"`
+		} `yaml:"secrets"`
+	}{
+		Secrets: make(map[string]struct {
+			File string `yaml:"file"`
+		}),
+	}
+
+	composeDir := filepath.Dir(ctx.composeFile)
+	for name, secret := range ctx.model.Secrets {
+		if secret.File == "" {
+			continue
+		}
+
+		localPath := secret.File
+		if !filepath.IsAbs(localPath) {
+			localPath = filepath.Join(composeDir, localPath)
+		}
+
+		remotePath := filepath.ToSlash(filepath.Join(remoteDir, filepath.Base(localPath)))
+
+		fmt.Fprintf(a.stdout, "  Copying %s -> %s\n", localPath, remotePath)
+
+		fileData, err := os.ReadFile(localPath)
+		if err != nil {
+			return func() {}, fmt.Errorf("failed to read local secret file %q: %w", localPath, err)
+		}
+
+		cmdArgs = append([]string(nil), baseArgs...)
+		cmdArgs = append(cmdArgs, fmt.Sprintf("cat > %q && chmod 600 %q", remotePath, remotePath))
+		cmd := exec.Command("ssh", cmdArgs...)
+		cmd.Stdin = bytes.NewReader(fileData)
+		if err := cmd.Run(); err != nil {
+			return func() {}, fmt.Errorf("failed to write remote secret file %q: %w", remotePath, err)
+		}
+
+		overrideModel.Secrets[name] = struct {
+			File string `yaml:"file"`
+		}{File: remotePath}
+	}
+
+	overrideData, err := yaml.Marshal(overrideModel)
+	if err != nil {
+		return func() {}, fmt.Errorf("failed to marshal secrets override: %w", err)
+	}
+
+	overrideFile, err := os.CreateTemp("", ".secrets-override-*.yml")
+	if err != nil {
+		return func() {}, fmt.Errorf("failed to create temp override file: %w", err)
+	}
+	defer overrideFile.Close()
+
+	if _, err := overrideFile.Write(overrideData); err != nil {
+		os.Remove(overrideFile.Name())
+		return func() {}, fmt.Errorf("failed to write override file: %w", err)
+	}
+
+	ctx.composeFiles = append(ctx.composeFiles, overrideFile.Name())
+
+	return func() {
+		os.Remove(overrideFile.Name())
+	}, nil
+}
+
 func (a *app) executeAction(ctx composeContext, profile, action string) error {
+	if action != "Host Shell" && action != "Host Shell (Unavailable)" && action != "Create External Networks" {
+		cleanupSecrets, err := a.syncSecretsToRemote(&ctx)
+		if err != nil {
+			return fmt.Errorf("failed to sync secrets: %w", err)
+		}
+		defer cleanupSecrets()
+	}
+
 	composeEnv := buildComposeEnv(ctx.envValues, profile, ctx.target.dockerHost)
 
 	switch action {
@@ -526,10 +654,10 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 			return err
 		}
 		fmt.Fprintln(a.stdout, "Deploying all services...")
-		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, composeBuildArgs("")...); err != nil {
+		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, composeBuildArgs("")...); err != nil {
 			return err
 		}
-		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "up", "-d", "--force-recreate", "--remove-orphans")
+		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "up", "-d", "--force-recreate", "--remove-orphans")
 	case "Redeploy Service":
 		service, err := a.selectService(ctx.model)
 		if err != nil {
@@ -539,54 +667,54 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 		if err := a.createExternalNetworks(ctx, composeEnv); err != nil {
 			return err
 		}
-		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, composeBuildArgs(service)...); err != nil {
+		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, composeBuildArgs(service)...); err != nil {
 			return err
 		}
-		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "up", "-d", "--force-recreate", "--remove-orphans", service)
+		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "up", "-d", "--force-recreate", "--remove-orphans", service)
 	case "Restart Service":
 		service, err := a.selectService(ctx.model)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(a.stdout, "Restarting service: %s...\n", service)
-		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "restart", service)
+		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "restart", service)
 	case "Undeploy Service":
 		service, err := a.selectService(ctx.model)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(a.stdout, "Undeploying service: %s...\n", service)
-		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "stop", service); err != nil {
+		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "stop", service); err != nil {
 			fmt.Fprintf(a.stderr, "Warning: failed to stop service %s before removal: %v\n", service, err)
 		}
-		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "rm", "-f", "-v", service)
+		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "rm", "-f", "-v", service)
 	case "Service Shell":
 		service, err := a.selectService(ctx.model)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(a.stdout, "Accessing shell for service: %s...\n", service)
-		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "exec", "-ti", service, "sh")
+		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "exec", "-ti", service, "sh")
 	case "Service Logs":
 		service, err := a.selectService(ctx.model)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(a.stdout, "Displaying logs for service: %s...\n", service)
-		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "logs", service)
+		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "logs", service)
 	case "Live Service Log Viewer":
 		service, err := a.selectService(ctx.model)
 		if err != nil {
 			return err
 		}
 		fmt.Fprintf(a.stdout, "Following live logs for service: %s (Press Ctrl+C to stop)...\n", service)
-		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "logs", "--tail", "0", "-f", service)
+		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "logs", "--tail", "0", "-f", service)
 	case "Undeploy All Services":
 		fmt.Fprintln(a.stdout, "Undeploying all services...")
-		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "down", "-v")
+		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "down", "-v")
 	case "Undeploy All Services (Keep Volumes)":
 		fmt.Fprintln(a.stdout, "Undeploying all services without removing volumes...")
-		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFile, true, "down")
+		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "down")
 	case "Create External Networks":
 		return a.createExternalNetworks(ctx, composeEnv)
 	case "Host Shell":
@@ -1508,12 +1636,16 @@ func buildComposeEnv(fileVars map[string]string, profile, dockerHost string) []s
 	return env
 }
 
-func composeBaseArgs(envFile, composeFile string) []string {
-	return []string{"compose", "--env-file", envFile, "-f", composeFile}
+func composeBaseArgs(envFile string, composeFiles []string) []string {
+	args := []string{"compose", "--env-file", envFile}
+	for _, f := range composeFiles {
+		args = append(args, "-f", f)
+	}
+	return args
 }
 
-func validateCompose(env []string, envFile, composeFile string) error {
-	args := append(composeBaseArgs(envFile, composeFile), "config", "--quiet")
+func validateCompose(env []string, envFile string, composeFiles []string) error {
+	args := append(composeBaseArgs(envFile, composeFiles), "config", "--quiet")
 	cmd := exec.Command("docker", args...)
 	cmd.Env = env
 	output, err := cmd.CombinedOutput()
@@ -1527,8 +1659,8 @@ func validateCompose(env []string, envFile, composeFile string) error {
 	return nil
 }
 
-func loadComposeModel(env []string, envFile, composeFile string) (composeModel, error) {
-	args := append(composeBaseArgs(envFile, composeFile), "config", "--format", "json")
+func loadComposeModel(env []string, envFile string, composeFiles []string) (composeModel, error) {
+	args := append(composeBaseArgs(envFile, composeFiles), "config", "--format", "json")
 	cmd := exec.Command("docker", args...)
 	cmd.Env = env
 	output, err := cmd.Output()
@@ -1581,6 +1713,9 @@ func loadComposeModelFromYAML(composeFile string, envValues map[string]string) (
 			Name     string      `yaml:"name"`
 			External interface{} `yaml:"external"`
 		} `yaml:"networks"`
+		Secrets map[string]struct {
+			File string `yaml:"file"`
+		} `yaml:"secrets"`
 	}
 
 	if err := yaml.Unmarshal([]byte(content), &raw); err != nil {
@@ -1591,6 +1726,7 @@ func loadComposeModelFromYAML(composeFile string, envValues map[string]string) (
 		Name:     raw.Name,
 		Services: make(map[string]json.RawMessage, len(raw.Services)),
 		Networks: make(map[string]composeNetwork, len(raw.Networks)),
+		Secrets:  make(map[string]composeSecret, len(raw.Secrets)),
 	}
 	for k := range raw.Services {
 		model.Services[k] = json.RawMessage("{}")
@@ -1608,6 +1744,9 @@ func loadComposeModelFromYAML(composeFile string, envValues map[string]string) (
 			name = k
 		}
 		model.Networks[k] = composeNetwork{Name: name, External: ext}
+	}
+	for k, s := range raw.Secrets {
+		model.Secrets[k] = composeSecret{File: s.File}
 	}
 
 	return model, nil
@@ -1666,8 +1805,8 @@ func composeBuildArgs(service string) []string {
 	return args
 }
 
-func runDockerCompose(env []string, envFile, composeFile string, interactive bool, args ...string) error {
-	base := composeBaseArgs(envFile, composeFile)
+func runDockerCompose(env []string, envFile string, composeFiles []string, interactive bool, args ...string) error {
+	base := composeBaseArgs(envFile, composeFiles)
 	return runDockerCommand(env, interactive, append(base, args...)...)
 }
 
