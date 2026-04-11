@@ -3,6 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -19,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -55,10 +60,28 @@ type composeSecret struct {
 }
 
 type composeModel struct {
-	Name     string                     `json:"name"`
-	Services map[string]json.RawMessage `json:"services"`
-	Networks map[string]composeNetwork  `json:"networks"`
-	Secrets  map[string]composeSecret   `json:"secrets"`
+	Name     string                    `json:"name"`
+	Services map[string]composeService `json:"services"`
+	Networks map[string]composeNetwork `json:"networks"`
+	Secrets  map[string]composeSecret  `json:"secrets"`
+}
+
+type composeService struct {
+	Image    string `json:"image"`
+	HasBuild bool   `json:"has_build"`
+}
+
+func (s *composeService) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Image string          `json:"image"`
+		Build json.RawMessage `json:"build"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	s.Image = strings.TrimSpace(raw.Image)
+	s.HasBuild = len(raw.Build) > 0 && string(raw.Build) != "null"
+	return nil
 }
 
 type composeNetwork struct {
@@ -75,15 +98,38 @@ type sshSpec struct {
 var errSelectionCancelled = errors.New("selection cancelled")
 var version = "dev"
 
+const databaseManagementAction = "Database Management Interface"
+const databaseManagementContainer = "postgres-db-admin"
+const databaseManagementService = "db-admin"
+const databaseManagementPort = "15432"
+
 type cliOptions struct {
-	profile     string
-	envFile     string
-	composeFile string
-	install     bool
-	update      bool
-	forceLocal  bool
-	showHelp    bool
-	showVersion bool
+	profile       string
+	envFile       string
+	composeFile   string
+	install       bool
+	update        bool
+	forceLocal    bool
+	forceRemote   bool
+	deployAll     bool
+	undeployAll   bool
+	deleteVolumes bool
+	noCache       bool
+	showHelp      bool
+	showVersion   bool
+}
+
+func (o cliOptions) directAction() (string, bool) {
+	switch {
+	case o.deployAll:
+		return "Deploy All Services", true
+	case o.undeployAll && o.deleteVolumes:
+		return "Undeploy All Services", true
+	case o.undeployAll:
+		return "Undeploy All Services (Keep Volumes)", true
+	default:
+		return "", false
+	}
 }
 
 type stringFlag struct {
@@ -233,34 +279,21 @@ func (a *app) run(args []string) error {
 		model:        model,
 	}
 
-	var target deploymentTarget
-	if options.forceLocal {
-		if ctx.sshURI != "" {
-			_, sshTarget, err := normalizeSSHURI(ctx.sshURI)
-			if err != nil {
-				return fmt.Errorf("invalid SSH_URI %q: %w", ctx.sshURI, err)
-			}
-			target = deploymentTarget{label: "Locally", sshTarget: sshTarget}
-			fmt.Fprintln(a.stdout, "Selected deployment method: Locally (--local overrides SSH_URI)")
-		} else {
-			target = deploymentTarget{label: "Locally"}
-			fmt.Fprintln(a.stdout, "Selected deployment method: Locally")
-		}
-	} else {
-		var err error
-		target, err = a.selectDeploymentTarget(ctx.sshURI)
+	target, err := a.resolveDeploymentTarget(ctx.sshURI, options)
+	if err != nil {
+		return err
+	}
+	ctx.target = target
+
+	action, directAction := options.directAction()
+	if !directAction {
+		action, err = a.selectMainAction(ctx)
 		if err != nil {
 			return err
 		}
 	}
-	ctx.target = target
 
-	action, err := a.selectMainAction(ctx)
-	if err != nil {
-		return err
-	}
-
-	if err := a.executeAction(ctx, options.profile, action); err != nil {
+	if err := a.executeAction(ctx, options.profile, options.noCache, action); err != nil {
 		return err
 	}
 
@@ -277,6 +310,11 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	var install bool
 	var update bool
 	var forceLocal bool
+	var forceRemote bool
+	var deployAll bool
+	var undeployAll bool
+	var deleteVolumes bool
+	var noCache bool
 	var help bool
 	var showVersion bool
 
@@ -294,6 +332,11 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	flagSet.BoolVar(&update, "update", false, "")
 	flagSet.BoolVar(&forceLocal, "l", false, "")
 	flagSet.BoolVar(&forceLocal, "local", false, "")
+	flagSet.BoolVar(&forceRemote, "remote", false, "")
+	flagSet.BoolVar(&deployAll, "deploy-all", false, "")
+	flagSet.BoolVar(&undeployAll, "undeploy-all", false, "")
+	flagSet.BoolVar(&deleteVolumes, "delete-volumes", false, "")
+	flagSet.BoolVar(&noCache, "no-cache", false, "")
 	flagSet.BoolVar(&help, "h", false, "")
 	flagSet.BoolVar(&help, "help", false, "")
 	flagSet.BoolVar(&showVersion, "v", false, "")
@@ -328,11 +371,52 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	if forceLocal {
 		options.forceLocal = true
 	}
+	if forceRemote {
+		options.forceRemote = true
+	}
+	if deployAll {
+		options.deployAll = true
+	}
+	if undeployAll {
+		options.undeployAll = true
+	}
+	if deleteVolumes {
+		options.deleteVolumes = true
+	}
+	if noCache {
+		options.noCache = true
+	}
 
 	remaining := flagSet.Args()
+	if options.forceLocal && options.forceRemote {
+		return options, errors.New("--local cannot be combined with --remote")
+	}
+	if options.deployAll && options.undeployAll {
+		return options, errors.New("--deploy-all cannot be combined with --undeploy-all")
+	}
+	if options.deleteVolumes && !options.undeployAll {
+		return options, errors.New("--delete-volumes requires --undeploy-all")
+	}
+	if _, directAction := options.directAction(); directAction {
+		if options.install {
+			return options, errors.New("direct action flags cannot be combined with --install")
+		}
+		if options.update {
+			return options, errors.New("direct action flags cannot be combined with --update")
+		}
+		if options.showHelp {
+			return options, errors.New("direct action flags cannot be combined with --help")
+		}
+		if options.showVersion {
+			return options, errors.New("direct action flags cannot be combined with --version")
+		}
+	}
 	if options.install {
 		if forceLocal {
 			return options, errors.New("--install cannot be combined with --local")
+		}
+		if forceRemote {
+			return options, errors.New("--install cannot be combined with --remote")
 		}
 		if profileFlag.set {
 			return options, errors.New("--install cannot be combined with --profile")
@@ -351,6 +435,9 @@ func parseCLIArgs(args []string) (cliOptions, error) {
 	if options.update {
 		if forceLocal {
 			return options, errors.New("--update cannot be combined with --local")
+		}
+		if forceRemote {
+			return options, errors.New("--update cannot be combined with --remote")
 		}
 		if profileFlag.set {
 			return options, errors.New("--update cannot be combined with --profile")
@@ -405,10 +492,16 @@ func (a *app) printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  -e, --env PATH         Preselect the env file")
 	fmt.Fprintln(w, "  -f, --file PATH        Preselect the compose file")
 	fmt.Fprintln(w, "  -l, --local            Use local Docker even if SSH_URI is set in the env file")
+	fmt.Fprintln(w, "      --remote           Use SSH_URI without prompting for deployment method")
+	fmt.Fprintln(w, "      --deploy-all       Run the Deploy All Services action directly")
+	fmt.Fprintln(w, "      --undeploy-all     Run the Undeploy All Services action directly")
+	fmt.Fprintln(w, "      --delete-volumes   With --undeploy-all, run docker compose down -v")
+	fmt.Fprintln(w, "      --no-cache         Rebuild images without using Docker build cache")
 	fmt.Fprintln(w, "  -v, --version          Show version and exit")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Notes:")
-	fmt.Fprintln(w, "  Actions are still selected in the terminal UI.")
+	fmt.Fprintln(w, "  Actions are still selected in the terminal UI unless a direct action flag is used.")
+	fmt.Fprintln(w, "  --undeploy-all keeps volumes by default; add --delete-volumes to remove them.")
 	fmt.Fprintln(w, "  The positional profile form remains supported for compatibility.")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Examples:")
@@ -419,6 +512,10 @@ func (a *app) printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  deploy --profile prod")
 	fmt.Fprintln(w, "  deploy -e .env.prod -f compose.yml")
 	fmt.Fprintln(w, "  deploy -p dev -f docker-compose.yaml -e liftorai.env --local")
+	fmt.Fprintln(w, "  deploy --deploy-all --local")
+	fmt.Fprintln(w, "  deploy --deploy-all --remote")
+	fmt.Fprintln(w, "  deploy --undeploy-all")
+	fmt.Fprintln(w, "  deploy --undeploy-all --delete-volumes --remote")
 	fmt.Fprintln(w, "  deploy --version")
 }
 
@@ -459,15 +556,91 @@ func (a *app) installSelf() error {
 	return nil
 }
 
+func resolveLocalDeploymentTarget(rawSSHURI string) (deploymentTarget, error) {
+	sshURI := strings.TrimSpace(rawSSHURI)
+	if sshURI == "" {
+		return deploymentTarget{label: "Locally"}, nil
+	}
+
+	_, sshTarget, err := normalizeSSHURI(sshURI)
+	if err != nil {
+		return deploymentTarget{}, fmt.Errorf("invalid SSH_URI %q: %w", sshURI, err)
+	}
+
+	return deploymentTarget{label: "Locally", sshTarget: sshTarget}, nil
+}
+
+func resolveRemoteDeploymentTarget(rawSSHURI string) (deploymentTarget, error) {
+	sshURI := strings.TrimSpace(rawSSHURI)
+	if sshURI == "" {
+		return deploymentTarget{}, errors.New("--remote requires SSH_URI to be set in the selected env file")
+	}
+
+	normalized, sshTarget, err := normalizeSSHURI(sshURI)
+	if err != nil {
+		return deploymentTarget{}, fmt.Errorf("invalid SSH_URI %q: %w", sshURI, err)
+	}
+
+	return deploymentTarget{
+		label:      sshURI,
+		dockerHost: normalized,
+		sshTarget:  sshTarget,
+	}, nil
+}
+
+func (a *app) resolveDeploymentTarget(rawSSHURI string, options cliOptions) (deploymentTarget, error) {
+	sshURI := strings.TrimSpace(rawSSHURI)
+
+	if options.forceLocal {
+		target, err := resolveLocalDeploymentTarget(sshURI)
+		if err != nil {
+			return deploymentTarget{}, err
+		}
+		if sshURI != "" {
+			fmt.Fprintln(a.stdout, "Selected deployment method: Locally (--local overrides SSH_URI)")
+		} else {
+			fmt.Fprintln(a.stdout, "Selected deployment method: Locally")
+		}
+		return target, nil
+	}
+
+	if options.forceRemote {
+		target, err := resolveRemoteDeploymentTarget(sshURI)
+		if err != nil {
+			return deploymentTarget{}, err
+		}
+		fmt.Fprintf(a.stdout, "Selected deployment method: Pre-configured SSH URI (%s) (--remote)\n", sshURI)
+		return target, nil
+	}
+
+	if _, directAction := options.directAction(); directAction {
+		if sshURI != "" {
+			return deploymentTarget{}, errors.New("direct action flags require either --local or --remote when SSH_URI is set")
+		}
+		target, err := resolveLocalDeploymentTarget("")
+		if err != nil {
+			return deploymentTarget{}, err
+		}
+		fmt.Fprintln(a.stdout, "Selected deployment method: Locally")
+		return target, nil
+	}
+
+	return a.selectDeploymentTarget(sshURI)
+}
+
 func (a *app) selectDeploymentTarget(rawSSHURI string) (deploymentTarget, error) {
 	sshURI := strings.TrimSpace(rawSSHURI)
 	if sshURI == "" {
 		a.msgBox("SSH_URI Not Set", "The selected env file does not set SSH_URI. Only local deployment is allowed.")
+		target, err := resolveLocalDeploymentTarget("")
+		if err != nil {
+			return deploymentTarget{}, err
+		}
 		fmt.Fprintln(a.stdout, "Selected deployment method: Locally")
-		return deploymentTarget{label: "Locally"}, nil
+		return target, nil
 	}
 
-	normalized, sshTarget, err := normalizeSSHURI(sshURI)
+	_, _, err := normalizeSSHURI(sshURI)
 	if err != nil {
 		return deploymentTarget{}, fmt.Errorf("invalid SSH_URI %q: %w", sshURI, err)
 	}
@@ -486,15 +659,19 @@ func (a *app) selectDeploymentTarget(rawSSHURI string) (deploymentTarget, error)
 
 	switch selected {
 	case sshURI:
+		target, err := resolveRemoteDeploymentTarget(sshURI)
+		if err != nil {
+			return deploymentTarget{}, err
+		}
 		fmt.Fprintf(a.stdout, "Selected deployment method: Pre-configured SSH URI (%s)\n", sshURI)
-		return deploymentTarget{
-			label:      sshURI,
-			dockerHost: normalized,
-			sshTarget:  sshTarget,
-		}, nil
+		return target, nil
 	case "Locally":
+		target, err := resolveLocalDeploymentTarget(sshURI)
+		if err != nil {
+			return deploymentTarget{}, err
+		}
 		fmt.Fprintln(a.stdout, "Selected deployment method: Locally")
-		return deploymentTarget{label: "Locally", sshTarget: sshTarget}, nil
+		return target, nil
 	default:
 		return deploymentTarget{}, fmt.Errorf("unknown deployment target %q", selected)
 	}
@@ -509,6 +686,7 @@ func (a *app) selectMainAction(ctx composeContext) (string, error) {
 		{label: "Service Shell"},
 		{label: "Service Logs"},
 		{label: "Live Service Log Viewer"},
+		{label: databaseManagementAction},
 		{label: "Undeploy All Services"},
 		{label: "Undeploy All Services (Keep Volumes)"},
 		{label: "Create External Networks"},
@@ -529,12 +707,8 @@ func (a *app) syncSecretsToRemote(ctx *composeContext) (func(), error) {
 		return func() {}, nil
 	}
 
-	// Docker Compose resolves top-level secrets `file:` paths on the machine
-	// that runs the CLI, even when DOCKER_HOST=ssh://... targets a remote
-	// daemon. The previous behavior copied files to ~/.deploy_secrets on the
-	// SSH host and rewrote compose paths there, which made the local client
-	// stat paths that only existed remotely and broke `docker compose build`.
 	composeDir := filepath.Dir(ctx.composeFile)
+	remoteSecrets := make(map[string]string)
 	for name, secret := range ctx.model.Secrets {
 		if secret.File == "" {
 			continue
@@ -546,13 +720,145 @@ func (a *app) syncSecretsToRemote(ctx *composeContext) (func(), error) {
 		if _, err := os.Stat(localPath); err != nil {
 			return nil, fmt.Errorf("compose secret %q: need file on this machine for remote Docker deploy: %w (%s)", name, err, localPath)
 		}
+		remotePath := remoteSecretPath(ctx.target.sshTarget, ctx.project, name)
+		if err := copySecretToRemote(ctx.target.sshTarget, localPath, remotePath); err != nil {
+			return nil, fmt.Errorf("compose secret %q: failed to copy to remote host: %w", name, err)
+		}
+		remoteSecrets[name] = remotePath
 	}
 
-	return func() {}, nil
+	if len(remoteSecrets) == 0 {
+		return func() {}, nil
+	}
+
+	overrideFile, err := writeSecretOverrideFile(remoteSecrets)
+	if err != nil {
+		return nil, err
+	}
+	ctx.composeFiles = append(ctx.composeFiles, overrideFile)
+
+	return func() {
+		if err := os.Remove(overrideFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(a.stderr, "Warning: failed to remove temporary secret override %s: %v\n", overrideFile, err)
+		}
+	}, nil
 }
 
-func (a *app) executeAction(ctx composeContext, profile, action string) error {
-	if action != "Host Shell" && action != "Host Shell (Unavailable)" && action != "Create External Networks" {
+func remoteSecretPath(target, project, name string) string {
+	spec, err := parseSSHSpec(target)
+	user := "deploy"
+	if err == nil && spec.user != "" {
+		user = spec.user
+	}
+	project = safeRemotePathSegment(project)
+	name = safeRemotePathSegment(name)
+	if project == "" {
+		project = "default"
+	}
+	if name == "" {
+		name = "secret"
+	}
+	return fmt.Sprintf("/home/%s/.deploy_secrets/%s/%s", safeRemotePathSegment(user), project, name)
+}
+
+func safeRemotePathSegment(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	return strings.Trim(b.String(), "._")
+}
+
+func copySecretToRemote(target, localPath, remotePath string) error {
+	spec, err := parseSSHSpec(target)
+	if err != nil {
+		return err
+	}
+
+	mkdirArgs := append(buildSystemSSHArgs(spec), "mkdir", "-p", shellQuote(remoteDir(remotePath)))
+	if err := runSystemCommand("ssh", mkdirArgs...); err != nil {
+		return err
+	}
+
+	scpArgs := buildSystemSCPArgs(spec, localPath, targetWithPath(spec, remotePath))
+	if err := runSystemCommand("scp", scpArgs...); err != nil {
+		return err
+	}
+
+	chmodArgs := append(buildSystemSSHArgs(spec), "chmod", "600", shellQuote(remotePath))
+	return runSystemCommand("ssh", chmodArgs...)
+}
+
+func remoteDir(path string) string {
+	path = strings.TrimRight(path, "/")
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		return path[:i]
+	}
+	return "."
+}
+
+func targetWithPath(spec sshSpec, path string) string {
+	return spec.user + "@" + spec.host + ":" + path
+}
+
+func buildSystemSCPArgs(spec sshSpec, localPath, remoteTarget string) []string {
+	args := make([]string, 0, 4)
+	if spec.port != "" && spec.port != "22" {
+		args = append(args, "-P", spec.port)
+	}
+	args = append(args, localPath, remoteTarget)
+	return args
+}
+
+func runSystemCommand(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	output, err := cmd.CombinedOutput()
+	if len(output) > 0 {
+		fmt.Print(string(output))
+	}
+	return err
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func writeSecretOverrideFile(secrets map[string]string) (string, error) {
+	type secretOverride struct {
+		File string `yaml:"file"`
+	}
+	payload := struct {
+		Secrets map[string]secretOverride `yaml:"secrets"`
+	}{Secrets: make(map[string]secretOverride, len(secrets))}
+	for name, path := range secrets {
+		payload.Secrets[name] = secretOverride{File: path}
+	}
+	data, err := yaml.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp("", ".deploy-secrets-*.yaml")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+func (a *app) executeAction(ctx composeContext, profile string, noCache bool, action string) error {
+	if action != "Host Shell" && action != "Host Shell (Unavailable)" && action != "Create External Networks" && action != databaseManagementAction {
 		cleanupSecrets, err := a.syncSecretsToRemote(&ctx)
 		if err != nil {
 			return fmt.Errorf("failed to sync secrets: %w", err)
@@ -568,7 +874,7 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 			return err
 		}
 		fmt.Fprintln(a.stdout, "Deploying all services...")
-		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, composeBuildArgs("")...); err != nil {
+		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, composePrepareArgs(ctx.model, "", noCache)...); err != nil {
 			return err
 		}
 		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "up", "-d", "--force-recreate", "--remove-orphans")
@@ -581,7 +887,7 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 		if err := a.createExternalNetworks(ctx, composeEnv); err != nil {
 			return err
 		}
-		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, composeBuildArgs(service)...); err != nil {
+		if err := runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, composePrepareArgs(ctx.model, service, noCache)...); err != nil {
 			return err
 		}
 		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "up", "-d", "--force-recreate", "--remove-orphans", service)
@@ -623,6 +929,8 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 		}
 		fmt.Fprintf(a.stdout, "Following live logs for service: %s (Press Ctrl+C to stop)...\n", service)
 		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "logs", "--tail", "0", "-f", service)
+	case databaseManagementAction:
+		return a.openDatabaseManagement(ctx, composeEnv)
 	case "Undeploy All Services":
 		fmt.Fprintln(a.stdout, "Undeploying all services...")
 		return runDockerCompose(composeEnv, ctx.envFile, ctx.composeFiles, true, "down", "-v")
@@ -638,6 +946,240 @@ func (a *app) executeAction(ctx composeContext, profile, action string) error {
 		return nil
 	default:
 		return fmt.Errorf("unknown action %q", action)
+	}
+}
+
+func (a *app) openDatabaseManagement(ctx composeContext, composeEnv []string) error {
+	container := databaseManagementContainer
+	sessionToken, err := randomSessionToken()
+	if err != nil {
+		return err
+	}
+	if ctx.target.label != "Locally" {
+		if err := ensureLocalPortAvailable(databaseManagementPort); err != nil {
+			return err
+		}
+	}
+
+	fmt.Fprintf(a.stdout, "Starting database management container: %s\n", container)
+	if err := a.startDatabaseManagementContainer(ctx, composeEnv, container); err != nil {
+		return err
+	}
+	defer func() {
+		fmt.Fprintf(a.stdout, "Stopping database management container: %s\n", container)
+		if err := runDockerCommand(composeEnv, true, "stop", container); err != nil {
+			fmt.Fprintf(a.stderr, "Warning: failed to stop %s: %v\n", container, err)
+		}
+	}()
+
+	baseURL := "http://127.0.0.1:" + databaseManagementPort
+	browserURL := baseURL + "/?session=" + url.QueryEscape(sessionToken)
+	if ctx.target.label == "Locally" {
+		if err := waitForDatabaseManagementHealth(baseURL, sessionToken, 15*time.Second); err != nil {
+			return err
+		}
+		a.openBrowserOrPrint(browserURL)
+		fmt.Fprintln(a.stdout, "Press Enter to close the interface.")
+		if a.reader != nil {
+			_, _ = a.reader.ReadString('\n')
+		}
+		if err := shutdownDatabaseManagement(baseURL, sessionToken); err != nil {
+			fmt.Fprintf(a.stderr, "Warning: failed to request db-admin shutdown: %v\n", err)
+		}
+		return nil
+	}
+	if ctx.target.sshTarget == "" {
+		return errors.New("database management interface requires SSH deployment or --local")
+	}
+	fmt.Fprintf(a.stdout, "Opening SSH tunnel for database management: %s\n", baseURL)
+	return a.openDatabaseManagementTunnel(baseURL, browserURL, sessionToken, ctx.target.sshTarget)
+}
+
+func (a *app) startDatabaseManagementContainer(ctx composeContext, composeEnv []string, container string) error {
+	if err := runDockerCommand(composeEnv, true, "start", container); err == nil {
+		return nil
+	}
+	return fmt.Errorf("failed to start %s. Deploy the Postgres stack first", container)
+}
+
+func ensureLocalPortAvailable(port string) error {
+	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", port))
+	if err != nil {
+		return fmt.Errorf("local port %s is not available: %w", port, err)
+	}
+	return listener.Close()
+}
+
+func (a *app) openDatabaseManagementTunnel(baseURL string, browserURL string, sessionToken string, target string) error {
+	spec, err := parseSSHSpec(target)
+	if err != nil {
+		return err
+	}
+	args := buildSystemSSHTunnelArgs(spec, databaseManagementPort, databaseManagementPort)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+	cmd.Stdout = a.stdout
+	cmd.Stderr = a.stderr
+	if err := cmd.Start(); err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			return errors.New("ssh executable not found; database management interface requires a local ssh client")
+		}
+		return err
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return err
+		}
+		return errors.New("ssh tunnel exited unexpectedly")
+	case <-time.After(700 * time.Millisecond):
+	}
+
+	if err := waitForDatabaseManagementHealth(baseURL, sessionToken, 15*time.Second); err != nil {
+		cancel()
+		<-done
+		return err
+	}
+	a.openBrowserOrPrint(browserURL)
+	fmt.Fprintln(a.stdout, "Press Enter to close the tunnel.")
+	if a.reader != nil {
+		_, _ = a.reader.ReadString('\n')
+	}
+
+	if err := shutdownDatabaseManagement(baseURL, sessionToken); err != nil {
+		fmt.Fprintf(a.stderr, "Warning: failed to request db-admin shutdown: %v\n", err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil && ctx.Err() == nil {
+			return err
+		}
+	case <-time.After(3 * time.Second):
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		<-done
+	}
+	if err := waitForLocalPortFree(databaseManagementPort, 2*time.Second); err != nil {
+		fmt.Fprintf(a.stderr, "Warning: %v\n", err)
+	}
+	return nil
+}
+
+func waitForDatabaseManagementHealth(baseURL string, sessionToken string, timeout time.Duration) error {
+	client := http.Client{Timeout: 1500 * time.Millisecond}
+	deadline := time.Now().Add(timeout)
+	healthURL := baseURL + "/api/health"
+	var lastStatus string
+	var lastBody string
+	var lastErr error
+	for {
+		req, err := http.NewRequest(http.MethodGet, healthURL, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("X-Db-Admin-Session", sessionToken)
+		resp, err := client.Do(req)
+		if err == nil {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			_ = resp.Body.Close()
+			lastStatus = resp.Status
+			lastBody = strings.TrimSpace(string(body))
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				var payload struct {
+					OK      bool   `json:"ok"`
+					Service string `json:"service"`
+				}
+				if json.Unmarshal(body, &payload) == nil && payload.OK && payload.Service == "postgres-db-admin" {
+					return nil
+				}
+				lastErr = fmt.Errorf("unexpected health payload %q", lastBody)
+			}
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			if lastStatus != "" {
+				return fmt.Errorf("database management interface did not become ready at %s; last response: %s %s", healthURL, lastStatus, lastBody)
+			}
+			return fmt.Errorf("database management interface did not become ready at %s: %w", healthURL, lastErr)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+}
+
+func shutdownDatabaseManagement(baseURL string, sessionToken string) error {
+	client := http.Client{Timeout: 1500 * time.Millisecond}
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/shutdown", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Db-Admin-Session", sessionToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("shutdown returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+func randomSessionToken() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("failed to generate db-admin session token: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+func (a *app) openBrowserOrPrint(url string) {
+	if err := openBrowser(url, runtime.GOOS); err != nil {
+		fmt.Fprintf(a.stderr, "Warning: failed to open browser: %v\n", err)
+		fmt.Fprintf(a.stdout, "Database management interface: %s\n", url)
+	}
+}
+
+func openBrowser(url string, goos string) error {
+	command, args, err := browserCommand(url, goos)
+	if err != nil {
+		return err
+	}
+	return exec.Command(command, args...).Start()
+}
+
+func browserCommand(url string, goos string) (string, []string, error) {
+	switch goos {
+	case "darwin":
+		return "open", []string{url}, nil
+	case "windows":
+		return "rundll32", []string{"url.dll,FileProtocolHandler", url}, nil
+	default:
+		return "xdg-open", []string{url}, nil
+	}
+}
+
+func waitForLocalPortFree(port string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", port))
+		if err == nil {
+			_ = listener.Close()
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("local port %s is still in use after closing the tunnel", port)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -1638,12 +2180,19 @@ func loadComposeModelFromYAML(composeFile string, envValues map[string]string) (
 
 	model := composeModel{
 		Name:     raw.Name,
-		Services: make(map[string]json.RawMessage, len(raw.Services)),
+		Services: make(map[string]composeService, len(raw.Services)),
 		Networks: make(map[string]composeNetwork, len(raw.Networks)),
 		Secrets:  make(map[string]composeSecret, len(raw.Secrets)),
 	}
-	for k := range raw.Services {
-		model.Services[k] = json.RawMessage("{}")
+	for k, rawService := range raw.Services {
+		service := composeService{}
+		if m, ok := rawService.(map[string]interface{}); ok {
+			_, service.HasBuild = m["build"]
+			if image, ok := m["image"].(string); ok {
+				service.Image = strings.TrimSpace(image)
+			}
+		}
+		model.Services[k] = service
 	}
 	for k, n := range raw.Networks {
 		ext := false
@@ -1710,13 +2259,33 @@ func externalNetworkNames(model composeModel) []string {
 	return names
 }
 
-func composeBuildArgs(service string) []string {
-	args := []string{"build", "--no-cache"}
+func composeBuildArgs(service string, noCache bool) []string {
+	args := []string{"build"}
+	if noCache {
+		args = append(args, "--no-cache")
+	}
 	service = strings.TrimSpace(service)
 	if service != "" {
 		args = append(args, service)
 	}
 	return args
+}
+
+func composePrepareArgs(model composeModel, service string, noCache bool) []string {
+	service = strings.TrimSpace(service)
+	if service != "" {
+		if svc, ok := model.Services[service]; ok && !svc.HasBuild && svc.Image != "" {
+			return []string{"pull", service}
+		}
+		return composeBuildArgs(service, noCache)
+	}
+
+	for _, svc := range model.Services {
+		if svc.HasBuild {
+			return composeBuildArgs("", noCache)
+		}
+	}
+	return []string{"pull"}
 }
 
 func runDockerCompose(env []string, envFile string, composeFiles []string, interactive bool, args ...string) error {
@@ -1858,5 +2427,30 @@ func buildSystemSSHArgs(spec sshSpec) []string {
 		args = append(args, "-p", spec.port)
 	}
 	args = append(args, spec.user+"@"+spec.host)
+	return args
+}
+
+func buildSystemSSHTunnelArgs(spec sshSpec, localPort, remotePort string) []string {
+	args := make([]string, 0, 13)
+	if spec.port != "" && spec.port != "22" {
+		args = append(args, "-p", spec.port)
+	}
+	args = append(
+		args,
+		"-N",
+		"-S",
+		"none",
+		"-o",
+		"ControlMaster=no",
+		"-o",
+		"ExitOnForwardFailure=yes",
+		"-o",
+		"ServerAliveInterval=5",
+		"-o",
+		"ServerAliveCountMax=1",
+		"-L",
+		localPort+":127.0.0.1:"+remotePort,
+		spec.user+"@"+spec.host,
+	)
 	return args
 }

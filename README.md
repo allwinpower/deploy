@@ -57,6 +57,11 @@ Supported flags:
 - `-e`, `--env` preselect the env file
 - `-f`, `--file` preselect the compose file
 - `-l`, `--local` use local Docker even if `SSH_URI` is set in the env file (skips the deployment-method prompt)
+- `--remote` use `SSH_URI` without prompting for the deployment method
+- `--deploy-all` run the Deploy All Services action directly
+- `--undeploy-all` run the Undeploy All Services action directly and keep volumes by default
+- `--delete-volumes` with `--undeploy-all`, run `docker compose down -v`
+- `--no-cache` rebuild images without using Docker build cache
 - `-v`, `--version` show the binary version and exit
 
 Examples:
@@ -70,6 +75,10 @@ Examples:
 ./deploy -p prod
 ./deploy -e .env.prod -f compose.yml
 ./deploy -p dev -f docker-compose.yaml -e liftorai.env --local
+./deploy --deploy-all --local
+./deploy --deploy-all --remote
+./deploy --undeploy-all
+./deploy --undeploy-all --delete-volumes --remote
 ./deploy --version
 ```
 
@@ -97,17 +106,20 @@ On launch the CLI opens an interactive terminal UI and walks through the same fl
 4. Select deployment method
 5. Run one action from the main menu
 
+When `--deploy-all` or `--undeploy-all` is passed, the CLI skips the main menu and runs that action directly. If the selected env file sets `SSH_URI`, direct actions require either `--local` or `--remote`.
+
 ## Main Menu Actions
 
 | Action | Description |
 |--------|-------------|
-| Deploy All Services | Rebuilds all images with `docker compose build --no-cache` and starts all containers with `up -d --force-recreate --remove-orphans` |
-| Redeploy Service | Rebuilds one selected service with `docker compose build --no-cache <service>` and restarts it |
+| Deploy All Services | Runs `docker compose build` for source-build services or `docker compose pull` for image-only services, then starts containers with `up -d --force-recreate --remove-orphans` |
+| Redeploy Service | Builds one selected source-build service or pulls one selected image-only service, then restarts it |
 | Restart Service | Restarts one selected service without rebuilding |
 | Undeploy Service | Stops and removes one selected service and its volumes |
 | Service Shell | Opens an interactive `sh` shell inside one selected service |
 | Service Logs | Prints logs for one selected service |
 | Live Service Log Viewer | Follows logs for one selected service until interrupted |
+| Database Management Interface | Starts the fixed `postgres-db-admin` container, opens `http://127.0.0.1:15432` in the browser, and stops the container when the action exits; remote deployments use an SSH tunnel |
 | Undeploy All Services | Runs `docker compose down -v` |
 | Undeploy All Services (Keep Volumes) | Runs `docker compose down` |
 | Create External Networks | Creates any external Docker networks declared in the compose file |
@@ -168,7 +180,8 @@ That workflow:
 4. A warning is shown if the raw compose file still contains a top-level `version` key.
 5. The resolved compose `name` must exist and exactly match env `PROJECT`.
 6. If `SSH_URI` is set, the user can choose between local deployment and the configured remote Docker host.
-7. Deploy and redeploy actions rebuild with `--no-cache` by default so remote hosts do not reuse stale image layers for production assets.
+7. Deploy and redeploy actions use normal Docker build cache by default for services with `build:`. Services with `image:` and no `build:` are pulled instead of rebuilt. Pass `--no-cache` to the CLI when you want source rebuilds to ignore cached layers for that run.
 8. When using a remote Docker daemon (`DOCKER_HOST=ssh://...`), file-based compose `secrets` are still read from **this machine** (paths relative to the compose file). Ensure those files exist locally before deploy; they are not rewritten to paths on the SSH host.
 9. All Compose actions run directly against the selected compose file and env file; no permanent modified compose file is written.
 10. The Host Shell action uses the local `ssh` client, so it follows your existing SSH config, agent state, and identity selection.
+11. The Database Management Interface action starts the fixed `postgres-db-admin` container directly with `docker start`, opens the browser with a per-launch session token, requests UI shutdown when the action exits, and then stops the container. It does not run Compose build/up. Remote mode disables SSH connection sharing and runs `ssh -N -S none -o ControlMaster=no -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=1 -L 15432:127.0.0.1:15432` so stale SSH mux processes do not keep the port open. If `postgres-db-admin` does not exist, deploy the Postgres stack first.
