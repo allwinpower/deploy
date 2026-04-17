@@ -59,6 +59,8 @@ type composeSecret struct {
 	File string `json:"file"`
 }
 
+const remoteSecretFileMode = "644"
+
 type composeModel struct {
 	Name     string                    `json:"name"`
 	Services map[string]composeService `json:"services"`
@@ -789,7 +791,7 @@ func copySecretToRemote(target, localPath, remotePath string) error {
 		return err
 	}
 
-	chmodArgs := append(buildSystemSSHArgs(spec), "chmod", "600", shellQuote(remotePath))
+	chmodArgs := append(buildSystemSSHArgs(spec), "chmod", remoteSecretFileMode, shellQuote(remotePath))
 	return runSystemCommand("ssh", chmodArgs...)
 }
 

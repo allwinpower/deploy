@@ -253,6 +253,12 @@ func TestRemoteSecretPathSanitizesSegments(t *testing.T) {
 	}
 }
 
+func TestRemoteSecretFileModeAllowsNonRootContainers(t *testing.T) {
+	if remoteSecretFileMode != "644" {
+		t.Fatalf("remote secret mode must allow non-root containers to read secrets, got %q", remoteSecretFileMode)
+	}
+}
+
 func TestWriteSecretOverrideFile(t *testing.T) {
 	path, err := writeSecretOverrideFile(map[string]string{
 		"gcp_sa": "/home/alice/.deploy_secrets/mediapilot/gcp_sa",
