@@ -143,6 +143,73 @@ func TestComposeFileHasTopLevelKey(t *testing.T) {
 	}
 }
 
+func TestSubstituteEnvVars(t *testing.T) {
+	env := map[string]string{
+		"PROJECT":                  "visireach",
+		"GOOGLE_OAUTH_CLIENT_FILE": "./client-secret.json",
+		"EMPTY":                    "",
+	}
+
+	got, err := substituteEnvVars(
+		"name: ${PROJECT}\nplain: $PROJECT\nsecret: ${GOOGLE_OAUTH_CLIENT_FILE:?GOOGLE_OAUTH_CLIENT_FILE is required}\ndefault: ${MISSING:-fallback}\n",
+		env,
+	)
+	if err != nil {
+		t.Fatalf("substituteEnvVars returned error: %v", err)
+	}
+
+	want := "name: visireach\nplain: visireach\nsecret: ./client-secret.json\ndefault: fallback\n"
+	if got != want {
+		t.Fatalf("unexpected substitution:\ngot  %q\nwant %q", got, want)
+	}
+}
+
+func TestSubstituteEnvVarsRequiredErrorsWhenMissing(t *testing.T) {
+	_, err := substituteEnvVars("file: ${GOOGLE_OAUTH_CLIENT_FILE:?GOOGLE_OAUTH_CLIENT_FILE is required}\n", map[string]string{})
+	if err == nil || err.Error() != "GOOGLE_OAUTH_CLIENT_FILE is required" {
+		t.Fatalf("expected required variable error, got %v", err)
+	}
+}
+
+func TestSubstituteEnvVarsRequiredErrorsWhenEmpty(t *testing.T) {
+	_, err := substituteEnvVars("file: ${GOOGLE_OAUTH_CLIENT_FILE:?GOOGLE_OAUTH_CLIENT_FILE is required}\n", map[string]string{
+		"GOOGLE_OAUTH_CLIENT_FILE": "",
+	})
+	if err == nil || err.Error() != "GOOGLE_OAUTH_CLIENT_FILE is required" {
+		t.Fatalf("expected required variable error, got %v", err)
+	}
+}
+
+func TestLoadComposeModelFromYAMLInterpolatesRequiredSecretFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "compose.yml")
+	content := `name: ${PROJECT}
+services:
+  web:
+    image: nginx
+secrets:
+  google_oauth_client:
+    file: ${GOOGLE_OAUTH_CLIENT_FILE:?GOOGLE_OAUTH_CLIENT_FILE is required}
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	model, err := loadComposeModelFromYAML(path, map[string]string{
+		"PROJECT":                  "visireach",
+		"GOOGLE_OAUTH_CLIENT_FILE": "./client-secret.json",
+	})
+	if err != nil {
+		t.Fatalf("loadComposeModelFromYAML returned error: %v", err)
+	}
+
+	got := model.Secrets["google_oauth_client"].File
+	want := "./client-secret.json"
+	if got != want {
+		t.Fatalf("unexpected secret file: got %q want %q", got, want)
+	}
+}
+
 func TestMenuModelNavigationAndSelection(t *testing.T) {
 	model := newMenuModel("Title", "Prompt", []menuOption{
 		{label: "first"},

@@ -18,7 +18,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -2137,23 +2136,126 @@ func loadComposeModel(env []string, envFile string, composeFiles []string) (comp
 	return model, nil
 }
 
-var envVarPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
+func substituteEnvVars(text string, env map[string]string) (string, error) {
+	var b strings.Builder
+	b.Grow(len(text))
 
-func substituteEnvVars(text string, env map[string]string) string {
-	return envVarPattern.ReplaceAllStringFunc(text, func(match string) string {
-		groups := envVarPattern.FindStringSubmatch(match)
-		var key, defaultVal string
-		if groups[1] != "" {
-			key = groups[1]
-			defaultVal = groups[2]
-		} else {
-			key = groups[3]
+	for i := 0; i < len(text); {
+		if text[i] != '$' {
+			b.WriteByte(text[i])
+			i++
+			continue
 		}
-		if val, ok := env[key]; ok {
-			return val
+
+		if i+1 >= len(text) {
+			b.WriteByte(text[i])
+			i++
+			continue
 		}
-		return defaultVal
-	})
+
+		next := text[i+1]
+		switch {
+		case next == '$':
+			b.WriteByte('$')
+			i += 2
+		case next == '{':
+			end := strings.IndexByte(text[i+2:], '}')
+			if end < 0 {
+				b.WriteByte(text[i])
+				i++
+				continue
+			}
+
+			expr := text[i+2 : i+2+end]
+			replacement, ok, err := resolveBracedEnvVar(expr, env)
+			if err != nil {
+				return "", err
+			}
+			if ok {
+				b.WriteString(replacement)
+			} else {
+				b.WriteString("${")
+				b.WriteString(expr)
+				b.WriteByte('}')
+			}
+			i += end + 3
+		case isEnvNameStart(next):
+			j := i + 2
+			for j < len(text) && isEnvNameChar(text[j]) {
+				j++
+			}
+			if val, ok := env[text[i+1:j]]; ok {
+				b.WriteString(val)
+			}
+			i = j
+		default:
+			b.WriteByte(text[i])
+			i++
+		}
+	}
+
+	return b.String(), nil
+}
+
+func resolveBracedEnvVar(expr string, env map[string]string) (string, bool, error) {
+	if expr == "" || !isEnvNameStart(expr[0]) {
+		return "", false, nil
+	}
+
+	i := 1
+	for i < len(expr) && isEnvNameChar(expr[i]) {
+		i++
+	}
+
+	key := expr[:i]
+	op := expr[i:]
+	val, set := env[key]
+
+	switch {
+	case op == "":
+		if set {
+			return val, true, nil
+		}
+		return "", true, nil
+	case strings.HasPrefix(op, ":-"):
+		if set && val != "" {
+			return val, true, nil
+		}
+		return op[2:], true, nil
+	case strings.HasPrefix(op, "-"):
+		if set {
+			return val, true, nil
+		}
+		return op[1:], true, nil
+	case strings.HasPrefix(op, ":?"):
+		if set && val != "" {
+			return val, true, nil
+		}
+		return "", true, requiredEnvVarError(key, op[2:])
+	case strings.HasPrefix(op, "?"):
+		if set {
+			return val, true, nil
+		}
+		return "", true, requiredEnvVarError(key, op[1:])
+	default:
+		return "", false, nil
+	}
+}
+
+func requiredEnvVarError(key, message string) error {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = key + " is required"
+	}
+	return errors.New(message)
+}
+
+func isEnvNameStart(c byte) bool {
+	return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+}
+
+func isEnvNameChar(c byte) bool {
+	return isEnvNameStart(c) || (c >= '0' && c <= '9')
 }
 
 func loadComposeModelFromYAML(composeFile string, envValues map[string]string) (composeModel, error) {
@@ -2162,7 +2264,10 @@ func loadComposeModelFromYAML(composeFile string, envValues map[string]string) (
 		return composeModel{}, err
 	}
 
-	content := substituteEnvVars(string(data), envValues)
+	content, err := substituteEnvVars(string(data), envValues)
+	if err != nil {
+		return composeModel{}, err
+	}
 
 	var raw struct {
 		Name     string                 `yaml:"name"`
